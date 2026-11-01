@@ -10038,6 +10038,8 @@ virtualkeyboard(struct wl_listener *listener, void *data)
 
 	/* Add the new keyboard to the group */
 	wlr_keyboard_group_add_keyboard(group->wlr_group, &kb->keyboard);
+	/* headless sessions have no physical keyboard to advertise one */
+	wlr_seat_set_capabilities(seat, seat->capabilities | WL_SEAT_CAPABILITY_KEYBOARD);
 }
 
 void
