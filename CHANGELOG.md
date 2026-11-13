@@ -4,6 +4,11 @@
 
 ### Added
 
+- Touchscreens: touches go to the window under the finger, while the overview
+  and windows without touch support get a left mouse button from the first
+  finger. Four fingers leave the application and act like a four-finger
+  touchpad swipe: sideways changes workspace, up and down open and close the
+  overview. The screen is the one the device names, otherwise the built-in panel
 - `install.sh --with-bar` now leaves a bar that starts: Quickshell comes from
   the distribution where it is packaged (Artix has it in `galaxy`, CachyOS in
   `extra`) and is built from source into the prefix everywhere else (Chimera,

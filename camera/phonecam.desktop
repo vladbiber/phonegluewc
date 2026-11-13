@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Camera
+Comment=Take photos
+Exec=phonecam
+Icon=camera-photo
+Terminal=false
+Categories=Graphics;Photography;Camera;
+Keywords=camera;photo;selfie;
+StartupNotify=true

@@ -1,0 +1,193 @@
+#!/bin/sh
+# Everything that writes a config file, plus the reads that need a pipe. Values arrive as
+# arguments and never pass through eval. A failed step leaves the old file in place.
+set -u
+LC_ALL=C; export LC_ALL
+cfg=${XDG_CONFIG_HOME:-$HOME/.config}
+state=${XDG_STATE_HOME:-$HOME/.local/state}
+die() { printf '%s\n' "$1" >&2; exit 1; }
+clean() { case "$1" in *[[:cntrl:]]*) die "control character in value" ;; esac; }
+is_mac() { printf '%s' "$1" | grep -Eqx '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' || die "bad device address"; }
+
+# edit PROGRAM FILE [create]: awk the file into a temp beside it, sync, rename; a symlink stays a symlink
+edit() {
+	mkdir -p -- "${2%/*}" || die "cannot create ${2%/*}"
+	file=$(readlink -f -- "$2") || die "cannot resolve $2"
+	src=$file
+	if [ -e "$file" ]; then
+		[ -r "$file" ] || die "cannot read $file"
+	else
+		[ "${3:-}" = create ] || die "$file does not exist yet"
+		src=/dev/null
+	fi
+	tmp=$(mktemp "$file.XXXXXX") || die "cannot write in ${file%/*}"
+	trap 'rm -f "$tmp"' EXIT
+	[ "$src" = /dev/null ] || cp -p -- "$file" "$tmp" || die "cannot copy $file"
+	awk "$1" "$src" >"$tmp" || die "cannot edit $file"
+	[ "${KEEP_LINES:-1}" = 0 ] || [ "$(wc -l <"$tmp")" -ge "$(wc -l <"$src")" ] || die "edit of $file would lose lines"
+	sync -- "$tmp" 2>/dev/null
+	mv -f -- "$tmp" "$file" || die "cannot replace $file"
+	trap - EXIT
+}
+
+# key = value, last match wins as it does for every reader; other lines stay byte for byte
+SET='
+	{ l[NR] = $0; s = $0; sub(/^[ \t]+/, "", s); n = index(s, "=")
+	  if (n && substr(s, 1, 1) != "#") { k = substr(s, 1, n - 1); sub(/[ \t]+$/, "", k); if (k == ENVIRON["K"]) at = NR } }
+	END { line = ENVIRON["K"] ENVIRON["SEP"] ENVIRON["V"]
+	      for (i = 1; i <= NR; i++) print (i == at ? line : l[i])
+	      if (!at) print line }'
+setkey() { # FILE KEY VALUE SEPARATOR [create]
+	K=$2 V=$3 SEP=$4 edit "$SET" "$1" "${5:-}"
+}
+
+# the last line for this output, or for *, gets key=value; other keys stay
+OUTPUT='
+	{ l[NR] = $0
+	  if ($0 ~ /^[ \t]*output[ \t]*=/) { s = $0; sub(/^[^=]*=[ \t]*/, "", s); split(s, t, /[ \t]+/)
+	    if (t[1] == ENVIRON["NAME"]) a = NR; else if (t[1] == "*") b = NR } }
+	END { at = a ? a : b
+	      for (i = 1; i <= NR; i++) {
+	        if (i != at) { print l[i]; continue }
+	        s = l[i]; sub(/^[^=]*=[ \t]*/, "", s); sub(/[ \t]+$/, "", s); n = split(s, t, /[ \t]+/)
+	        out = "output = " t[1]; done = 0
+	        for (j = 2; j <= n; j++) {
+	          if (index(t[j], ENVIRON["K"] "=") == 1) { out = out " " ENVIRON["K"] "=" ENVIRON["V"]; done = 1 }
+	          else out = out " " t[j] }
+	        if (!done) out = out " " ENVIRON["K"] "=" ENVIRON["V"]
+	        print out }
+	      if (!at) print "output = * " ENVIRON["K"] "=" ENVIRON["V"] }'
+
+# the handler keys of the default browser, in the section the spec reads them from
+MIME='
+	function put() { for (i = 1; i <= 3; i++) if (!(k[i] in seen)) print k[i] "=" ENVIRON["ID"] ";"; done = 1 }
+	BEGIN { k[1] = "x-scheme-handler/http"; k[2] = "x-scheme-handler/https"; k[3] = "text/html" }
+	/^\[/ { if (sec && !done) put(); sec = ($0 == "[Default Applications]"); if (sec) found = 1; print; next }
+	sec { n = index($0, "="); key = n ? substr($0, 1, n - 1) : ""
+	      if (key == k[1] || key == k[2] || key == k[3]) { seen[key] = 1; print key "=" ENVIRON["ID"] ";"; next } }
+	{ print }
+	END { if (sec && !done) put(); if (!found) { print "[Default Applications]"; put() } }'
+
+# new ids in the order given, comments kept at the top
+PINNED='
+	/^[ \t]*(#|$)/ { print }
+	END { n = split(ENVIRON["IDS"], a, " "); for (i = 1; i <= n; i++) print a[i] ".desktop" }'
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+set)
+	[ $# = 3 ] || die "usage: set FILE KEY VALUE"
+	clean "$3"
+	case "$1:$2" in
+	phone:accent) printf '%s' "$3" | grep -Eqx '#[0-9a-fA-F]{6}' || die "bad colour" ;;
+	kbd:predict | kbd:autocorrect | kbd:learn | kbd:emoji_history | kbd:clipboard_history | kbd:autocap | kbd:double_space | kbd:space_cursor | kbd:number_row | \
+	kbd:key_borders | kbd:corner_hints | kbd:key_preview | kbd:sound | kbd:vibrate) case $3 in on | off) ;; *) die "bad value" ;; esac ;;
+	kbd:height) case $3 in small | normal | large) ;; *) die "bad value" ;; esac ;;
+	kbd:theme) case $3 in phone | dark | light | system | contrast | red) ;; *) die "bad value" ;; esac ;;
+	kbd:accent) case $3 in theme | red | orange | yellow | green | blue | purple) ;; *) die "bad value" ;; esac ;;
+	kbd:long_press) case $3 in short | normal | long) ;; *) die "bad value" ;; esac ;;
+	kbd:predict_languages) [ -z "$3" ] || printf '%s' "$3" | grep -Eqx '[a-z][a-z-]{1,11}( [a-z][a-z-]{1,11}){0,31}' || die "bad languages" ;;
+	phone:ringer) case $3 in normal | vibrate | silent) ;; *) die "bad value" ;; esac ;;
+	phone:theme) case $3 in dark | light) ;; *) die "bad value" ;; esac ;;
+	phone:power_double | phone:power_triple) case $3 in camera | flashlight | screenshot | none) ;; *) die "bad value" ;; esac ;;
+	phone:dnd | phone:animations | phone:dynamic_camera) case $3 in on | off) ;; *) die "bad value" ;; esac ;;
+	phone:lock_clock) case $3 in dot | thin | bold | small | stacked) ;; *) die "bad value" ;; esac ;;
+	phone:lock_clock_color) case $3 in auto | white | accent | wallpaper) ;; *) die "bad value" ;; esac ;;
+	phone:dyn_music | phone:dyn_calls | phone:dyn_charging | phone:dyn_recording | phone:dyn_timers | phone:dyn_nav | phone:dyn_flashlight | phone:dyn_ringer | phone:dyn_levels | phone:dyn_network | phone:dyn_devices | phone:dyn_privacy | phone:dyn_unlock | phone:dyn_screenshot | phone:dyn_transfer | phone:dyn_notifications | phone:dyn_apps)
+		case $3 in on | off) ;; *) die "bad value" ;; esac ;;
+	phone:vibration_mv) case $3 in 1[5-9]00 | 2[0-9]00 | 3[0-6]00) ;; *) die "bad value" ;; esac ;;
+	phone:camera_hole)
+		case $3 in
+		auto) ;;
+		*[!0-9.,]* | "") die "bad position" ;;
+		*) printf '%s' "$3" | awk -F, 'NF == 3 && $1 ~ /^[0-9]+(\.[0-9]+)?$/ && $2 ~ /^[0-9]+(\.[0-9]+)?$/ && $3 ~ /^[0-9]+(\.[0-9]+)?$/ && $1 + $3 <= 1080 && $2 <= 400 && $3 >= 8 && $3 <= 200 { ok = 1 } END { exit !ok }' || die "bad position" ;;
+		esac ;;
+	config:xwayland) case $3 in on | off) ;; *) die "bad value" ;; esac ;;
+	config:xkb_layout) printf '%s' "$3" | grep -Eqx '[a-z]{2,8}(,[a-z]{2,8})*' || die "bad layout" ;;
+	*) die "unknown setting $1:$2" ;;
+	esac
+	case $1 in
+	phone) setkey "$cfg/phonegluewc/phone.conf" "$2" "$3" = create ;;
+	config) setkey "$cfg/phonegluewc/config.conf" "$2" "$3" " = " ;;
+	kbd) setkey "$cfg/phonekbd/config" "$2" "$3" " = " create ;;
+	esac
+	;;
+wallpaper)
+	[ $# = 1 ] || die "usage: wallpaper PATH"
+	clean "$1"
+	case $1 in "" | /*) ;; *) die "wallpaper must be an absolute path" ;; esac
+	setkey "$cfg/phonegluewc/phone.conf" wallpaper "$1" = create
+	setkey "$cfg/phonegluewc/login.conf" wallpaper "$1" = create
+	;;
+output)
+	[ $# = 3 ] || die "usage: output NAME KEY VALUE"
+	clean "$1"
+	case $2 in
+	scale) printf '%s' "$3" | grep -Eqx '[0-9]{1,2}(\.[0-9]{1,3})?' && V=$3 awk 'BEGIN { exit !(ENVIRON["V"] >= 0.5 && ENVIRON["V"] <= 10) }' || die "bad scale" ;;
+	transform) case $3 in normal | 90 | 180 | 270) ;; *) die "bad transform" ;; esac ;;
+	*) die "unknown output key" ;;
+	esac
+	NAME=$1 K=$2 V=$3 edit "$OUTPUT" "$cfg/phonegluewc/config.conf"
+	;;
+browser)
+	[ $# = 1 ] || die "usage: browser ID"
+	printf '%s' "$1" | grep -Eqx '[A-Za-z0-9._-]+' || die "bad app id"
+	ID=$1.desktop edit "$MIME" "$cfg/mimeapps.list" create
+	;;
+pinned)
+	for id; do printf '%s' "$id" | grep -Eqx '[A-Za-z0-9._-]+' || die "bad app id"; done
+	IDS="$*" KEEP_LINES=0 edit "$PINNED" "$cfg/phonegluewc/pinned-apps" create
+	;;
+kbd-layout)
+	case ${1:-} in normal | laptop) ;; *) die "bad layout" ;; esac
+	V=$1 KEEP_LINES=0 edit 'END { print ENVIRON["V"] }' "$state/phonekbd/layout" create
+	;;
+bt-list)
+	timeout 3 bluetoothctl devices | while read -r _ mac name; do
+		timeout 3 bluetoothctl info "$mac" | N=$name M=$mac awk '
+			/Paired:/ { p = $2 } /Connected:/ { c = $2 } /Icon:/ { ic = $2 }
+			/Battery Percentage:/ { gsub(/[()]/, "", $NF); b = $NF }
+			END { printf "%s\t%s\t%s\t%s\t%s\t%s\n", ENVIRON["M"], p, c, ic, b, ENVIRON["N"] }'
+	done
+	;;
+bt-power)
+	case ${1:-} in
+	off) timeout 6 bluetoothctl power off ;;
+	on) timeout 6 bluetoothctl power on || { command -v rfkill >/dev/null && rfkill unblock bluetooth && sleep 1 && timeout 6 bluetoothctl power on; } ;;
+	*) die "bad state" ;;
+	esac
+	;;
+bt-pair)
+	is_mac "${1:-}"
+	timeout 25 bluetoothctl pair "$1" || exit 1
+	timeout 6 bluetoothctl trust "$1"
+	timeout 15 bluetoothctl connect "$1"
+	;;
+kbd-langs)
+	for f in "${XDG_DATA_HOME:-$HOME/.local/share}"/phonekbd/langs/*/words.tsv; do
+		[ -f "$f" ] || continue
+		c=${f%/words.tsv}; c=${c##*/}
+		printf '%s\n' "$c" | grep -Ex '[a-z][a-z-]{1,11}' | grep -vx en
+	done
+	;;
+images)
+	# the shipped wallpapers sit beside settings/, in the repo and once installed
+	own=$(cd -P -- "${0%/*}/../wallpapers" 2>/dev/null && pwd) || own=
+	[ -z "$own" ] || find "$own" -maxdepth 1 -type f -iname '*.jpg' | sort
+	find "$HOME/Pictures" "${XDG_DATA_HOME:-$HOME/.local/share}/wallpapers" /usr/share/backgrounds -maxdepth 3 -type f \
+		\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) 2>/dev/null | head -60
+	;;
+about)
+	model=$(tr -d '\0' </proc/device-tree/model 2>/dev/null) || model=
+	[ -n "$model" ] || model=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
+	os=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release 2>/dev/null)
+	printf 'device\t%s\nos\t%s\nkernel\t%s\n' "$model" "$os" "$(uname -r)"
+	awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "ram\t%d\t%d\n", t, a }' /proc/meminfo
+	df -Pk / | awk 'NR == 2 { printf "disk\t%d\t%d\n", $2, $4 }'
+	printf 'zone\t%s\n' "$(date +%Z)"
+	;;
+*)
+	die "unknown command: $cmd"
+	;;
+esac

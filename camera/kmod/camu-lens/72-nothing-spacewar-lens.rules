@@ -1,0 +1,2 @@
+# the session (plugdev) moves the ultra-wide lens
+ACTION=="add", SUBSYSTEM=="module", KERNEL=="camu_lens", RUN+="/bin/chgrp plugdev /sys/module/camu_lens/parameters/pos"

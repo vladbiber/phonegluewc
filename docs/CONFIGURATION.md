@@ -1,6 +1,6 @@
 # Configuration
 
-gluewc reads `~/.config/gluewc/config.conf`. The installed session creates it
+phonegluewc reads `~/.config/phonegluewc/config.conf`. The installed session creates it
 from `config.def.conf` on first login.
 
 ## Saving applies
@@ -15,13 +15,13 @@ mount.
 
 A line the parser rejects is skipped, and everything that did parse still
 applies — a typo can never leave the session without keybinds. To make sure a
-mistake is not missed, gluewc reports it three ways:
+mistake is not missed, phonegluewc reports it three ways:
 
 - a red strip across the top of the screen for five seconds, which needs
   nothing installed,
 - a `notify-send` notification naming the line and what was wrong with it, when
   a notification daemon is running,
-- a line in `~/.local/state/gluewc.log`, always:
+- a line in `~/.local/state/phonegluewc.log`, always:
 
 ```text
 config:24: bad bind 'mod+NoSuchKey = spawn:true'
@@ -89,7 +89,7 @@ niri-style scroll layout and the driftwm-style drift canvas.
 | Setting | Value | Meaning |
 | --- | --- | --- |
 | `layout` | `bsp`, `scroll`, `drift` | layout every monitor starts in |
-| `remember_layout` | boolean | reopen in the layout the last session ended in (saved in `$XDG_STATE_HOME/gluewc/layout`), overriding `layout` |
+| `remember_layout` | boolean | reopen in the layout the last session ended in (saved in `$XDG_STATE_HOME/phonegluewc/layout`), overriding `layout` |
 | `drift_snap` | integer | drift: distance at which dragged edges snap, in canvas pixels |
 | `drift_nudge` | integer | drift: pixels a window moves per keyboard nudge |
 | `drift_zoom_min` | float | drift: how far the camera can zoom out |
@@ -122,7 +122,7 @@ autostart = swaybg -i ~/Pictures/wallpaper.jpg -m fill
 ```
 
 Wallpaper programs should use a background or bottom layer-shell surface.
-gluewc copies those layers into the overview, and a wallpaper that changes
+phonegluewc copies those layers into the overview, and a wallpaper that changes
 while the overview is up changes in the cards too. If none is running,
 `root_color` is shown. glueqs paints the wallpaper itself, so with it there
 is no wallpaper line at all.
@@ -145,7 +145,7 @@ Actions:
 | --- | --- |
 | `spawn:COMMAND` | run a shell command |
 | `macro:stop_all` | stop every macro and release synthetic keys/buttons |
-| `wm:quit` | quit gluewc |
+| `wm:quit` | quit phonegluewc |
 | `wm:reload` | reload the runtime config |
 | `wm:overview` | toggle overview |
 | `wm:toggle_opacity` | toggle configured window opacity |
@@ -203,7 +203,7 @@ items are XKB key combinations, `wait:MILLISECONDS`, or
 `press` controls how long a generated key or button stays down. Macro triggers
 take priority over ordinary compositor binds using the same combination.
 
-All macros stop when the session locks or the configuration reloads. gluewc
+All macros stop when the session locks or the configuration reloads. phonegluewc
 also releases any generated key or mouse button that was down at that moment.
 
 ## Media, volume and backlight
@@ -223,7 +223,7 @@ working as they always did, and normal mode has the same keys without `Super`.
 
 The commands pick the helper that is installed rather than insisting on one:
 `wpctl` (WirePlumber, present on any PipeWire system) before `pactl`. The
-backlight keys run `gluewc-backlight up|down`, a small script installed next
+backlight keys run `phonegluewc-backlight up|down`, a small script installed next
 to the compositor that wraps `brightnessctl` (or `light`) and walks the ladder
 0, 1, 2 ... 10, 15, 20 ... 100: 5% steps where the difference is barely
 visible, 1% steps in the dark, and 0 turns the panel off. Playback uses
@@ -304,6 +304,12 @@ software boost above it.
 
 Touchpad gesture availability depends on libinput and the hardware.
 
+On a touchscreen, one to three fingers belong to the application under them.
+The overview and windows without touch support see the first finger as a left
+mouse button. A fourth finger cancels those touches and starts the four-finger
+touchpad swipe, with `swipe_distance` measured in screen pixels. The session
+lock keeps all touches.
+
 ## Monitors
 
 Every output can be set up from the config file, and a saved change is applied
@@ -317,7 +323,7 @@ output = DP-2 enabled=false
 ```
 
 The name is the one the monitor has on the wire (`eDP-1`, `DP-1`, `HDMI-A-1`);
-`gluewc-msg outputs` lists them. `*` stands for every output that has no line
+`phonegluewc-msg outputs` lists them. `*` stands for every output that has no line
 of its own, and a later line for the same name overrides the earlier one key
 by key.
 
@@ -355,8 +361,8 @@ source a fixed `pos` if the numbers matter.
 
 ### The outputs state file
 
-Whenever the layout changes gluewc rewrites `$XDG_STATE_HOME/gluewc/outputs`
-(`~/.local/state/gluewc/outputs`), one tab-separated line per output, on or
+Whenever the layout changes phonegluewc rewrites `$XDG_STATE_HOME/phonegluewc/outputs`
+(`~/.local/state/phonegluewc/outputs`), one tab-separated line per output, on or
 off:
 
 ```text
@@ -365,15 +371,102 @@ name=DP-1	enabled=1	x=0	y=0	w=1920	h=1080	pw=1920	ph=1080	hz=60.00	scale=1.00	tr
 
 `w`/`h` are the logical size after scale and transform, `pw`/`ph` the pixels of
 the current mode, `modes` every fixed mode the monitor offers, `mirror` the
-source it is copying right now. `gluewc-msg outputs` prints the file. The
+source it is copying right now. `phonegluewc-msg outputs` prints the file. The
 glueqs settings panel has a Monitors page built on it: it draws the layout,
 lets you drag screens around, pick modes and scales, mirror one or all, and
 writes the `output` lines above.
 
+## Dynamic camera
+
+A black shape grows out of the screen's camera hole to show what is going on. It
+is on by default; with nothing to show it draws nothing and takes no touches.
+Settings, Dynamic camera has all of this. In `phone.conf`:
+
+```ini
+dynamic_camera = on        # off: activities stay in the top bar and panel
+camera_hole = 89.3,42.31,52.38   # x,y,diameter in pixels of a 1080 wide panel; absent means automatic
+dyn_music = on             # off hides one kind; all default to on
+```
+
+The kinds are `music calls notifications charging recording timers nav transfer
+flashlight ringer levels network devices privacy unlock screenshot apps`.
+
+Automatic looks up the first device tree compatible in `shell/camera-holes`. With
+no entry and no saved position, a centred pill sits at the top with no hole
+assumed.
+
+### Posting an activity
+
+`phonecamera` posts, updates and ends a live activity. Apps and scripts can use it
+as they are:
+
+```sh
+phonecamera post --id pizza --icon note --head Pizza --title "On its way" --tail 12m \
+    --progress 0.4 --button track:Track --ttl 1800 --wait
+phonecamera update --id pizza --tail 8m --progress 0.7
+phonecamera end pizza
+```
+
+`--kind` is `live` (default), `call`, `nav` or `transfer`. `--app` names the desktop
+entry a hold opens. `--wait` stays connected and prints a JSON line per button pressed.
+Without it a helper stays behind, watching the caller. Either way the activity ends
+when that process goes, or when `--ttl` seconds pass.
+
+A phone app reports calls the same way, since the shell has no modem code:
+
+```sh
+phonecamera post --id c --kind call --state incoming --title Alex --wait
+phonecamera update --id c --state active --elapsed --muted 0 --speaker 0
+```
+
+The buttons it receives are `answer`, `decline`, `mute`, `speaker` and `hangup`; it
+updates or ends the activity itself.
+
+`phonecamera timer SECONDS`, `stopwatch`, `cancel timer|stopwatch` drive the built-in
+clocks. `poll` asks the shell to reread battery, volume and the like at once.
+
+The socket is `$XDG_RUNTIME_DIR/phonegluewc-camera.sock`, one JSON object per line. Limits:
+id 32, title 64, text 140, head 24, tail 12 characters, a line of 4096 bytes, 30
+messages a second, 4 activities a connection and 16 overall. Text is always plain.
+An icon is a name for the usual lookup, never a path or URL. Any process of the same
+user can update or end any activity by its id. On the lock screen a third party
+activity shows only its icon.
+
 ## Bars and shells
 
 Layer-shell panels reserve their exclusive area automatically, including during
-overview transitions. gluewc advertises `dwl-ipc-unstable-v2` for workspace
+overview transitions. phonegluewc advertises `dwl-ipc-unstable-v2` for workspace
 modules and the foreign-toplevel protocol for window lists. A Waybar config can
-therefore use the `dwl/tags` module even though gluewc presents them as fixed
+therefore use the `dwl/tags` module even though phonegluewc presents them as fixed
 workspaces.
+
+## X11 apps
+
+```
+xwayland = on    # default; off opens no X socket
+```
+
+X11 apps run through [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
+(0.8 or newer, for `-listenfd`), not through the Xwayland built into dwl, which stays
+off in `config.mk`. At startup phonegluewc only opens the X socket: the first free
+display from `:1` up (`:0` is left to a real X server), both the abstract and the
+`/tmp/.X11-unix/XN` socket, plus the `/tmp/.XN-lock` file, and sets `DISPLAY` for
+the shell and every app it starts. Nothing runs until the first X11 client
+connects; then satellite starts and takes over the sockets. If satellite exits, it
+starts again on the next client; if it exits within two seconds of starting, X11 is
+off until the next login. The socket and the lock are removed on exit. With no
+`xwayland-satellite` on `PATH`, no socket is opened and `DISPLAY` is not set.
+
+X11 windows are ordinary toplevels: they show in the overview, the tray and the app
+menu. Their app id is the WM_CLASS class (`XTerm` for xterm), which matches
+`StartupWMClass` in the app's `.desktop` file.
+
+The setting is read at startup; a reload does not open or close the socket. The
+Settings app has the same switch under Apps, Older apps.
+
+Memory, measured headless with one xterm open: satellite about 4.5 MiB PSS and
+Xwayland about 32 MiB PSS (72 MiB RSS), only while X11 apps run.
+
+On the phone: Alpine edge ships `xwayland-satellite` 0.8.1 in `community` for
+aarch64 (checked 2026-11-08), the same version as on the laptop, so Nura gets it
+with `apk add xwayland-satellite`.

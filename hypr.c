@@ -1,7 +1,7 @@
 /* Enough of Hyprland's IPC for a shell written against Hyprland (MacShell):
  * the request socket (hyprctl, Quickshell.Hyprland) answers the JSON
  * queries and the Lua/classic dispatchers the shell uses, the event socket
- * carries the window and workspace events. Workspaces are gluewc's own:
+ * carries the window and workspace events. Workspaces are phonegluewc's own:
  * id = output index * NUMWS + space + 1; minimized and hidden windows sit on
  * the special workspaces "special:minimized" and "special:hidden". */
 
@@ -42,9 +42,9 @@ static char hypr_prevmons[16][64];
 static int hypr_prevmonws[16], hypr_nprevmons = -1;
 static struct wl_event_source *hypr_idle;
 
-/* This file comes from gluemac. gluewc has no minimized windows, a fixed
+/* This file comes from gluemac. phonegluewc has no minimized windows, a fixed
  * number of workspaces and a tiling layout, so the gluemac calls below are
- * answered with what gluewc has. */
+ * answered with what phonegluewc has. */
 enum { MinNone, MinMinimized, MinHidden };
 enum { TileLeft, TileRight, TileTop, TileBottom };
 
@@ -546,7 +546,7 @@ hyprjdevices(FILE *f)
 			XKB_STATE_LAYOUT_EFFECTIVE) : 0;
 	const char *name = kb->keymap ? xkb_keymap_layout_get_name(kb->keymap, cur) : NULL;
 
-	fputs("{\"mice\":[],\"keyboards\":[{\"address\":\"0x1\",\"name\":\"gluewc-keyboard\","
+	fputs("{\"mice\":[],\"keyboards\":[{\"address\":\"0x1\",\"name\":\"phonegluewc-keyboard\","
 			"\"rules\":\"\",\"model\":\"\",\"layout\":", f);
 	jstr(f, xkb_rules.layout ? xkb_rules.layout : "us");
 	fputs(",\"variant\":", f);
@@ -980,7 +980,7 @@ hyprdispatchone(const char *e)
 		setfloating(c, !strcmp(v, "enable") ? 1 : !strcmp(v, "disable") ? 0
 				: !c->isfloating);
 	} else if (IS("window.pin") || IS("window.set_prop")) {
-		/* no pinned windows in gluewc */
+		/* no pinned windows in phonegluewc */
 	} else if (IS("window.center")) {
 		struct wlr_box b;
 		hyprboxof(c, &b);
@@ -1095,7 +1095,7 @@ classic:
 			if ((c = *rest ? hyprselect(rest) : hyprfocused()))
 				setfloating(c, !c->isfloating);
 		} else if (!strcmp(d, "pin") || !strcmp(d, "setprop") || !strcmp(d, "togglesplit")) {
-			/* no pinning or split direction in gluewc */
+			/* no pinning or split direction in phonegluewc */
 		} else if (!strcmp(d, "centerwindow")) {
 			if ((c = hyprfocused()))
 				return hyprdispatchone("hl.dsp.window.center()");
@@ -1170,12 +1170,12 @@ hyprcommand(FILE *f, char *cmd)
 	} else if (!strcmp(cmd, "devices")) {
 		hyprjdevices(f);
 	} else if (!strcmp(cmd, "status")) {
-		fputs("{\"configProvider\":\"lua\",\"compositor\":\"gluewc\"}", f);
+		fputs("{\"configProvider\":\"lua\",\"compositor\":\"phonegluewc\"}", f);
 	} else if (!strcmp(cmd, "version")) {
-		fputs(json ? "{\"branch\":\"gluewc\",\"commit\":\"\",\"version\":\"0.56.0\","
+		fputs(json ? "{\"branch\":\"phonegluewc\",\"commit\":\"\",\"version\":\"0.56.0\","
 				"\"dirty\":false,\"commit_message\":\"\",\"commit_date\":\"\",\"tag\":\"v0.56.0\","
 				"\"commits\":\"0\",\"buildAquamarine\":\"\",\"flags\":[]}"
-				: "gluewc (Hyprland IPC 0.56.0)", f);
+				: "phonegluewc (Hyprland IPC 0.56.0)", f);
 	} else if (!strncmp(cmd, "switchxkblayout", 15)) {
 		char *last = strrchr(cmd, ' ');
 		hyprsetlayout(last ? last + 1 : "next");
@@ -1281,9 +1281,9 @@ hyprlisten(const char *name, struct wl_list *list, struct wl_event_source **src)
 	return fd;
 }
 
-/* $XDG_RUNTIME_DIR/hypr/gluewc-<display>/.socket{,2}.sock; the session
+/* $XDG_RUNTIME_DIR/hypr/phonegluewc-<display>/.socket{,2}.sock; the session
  * hands HYPRLAND_INSTANCE_SIGNATURE to the shell only, so other programs
- * never take gluewc for Hyprland */
+ * never take phonegluewc for Hyprland */
 static void
 hyprsetup(const char *socket)
 {
@@ -1295,7 +1295,7 @@ hyprsetup(const char *socket)
 	wl_list_init(&hypr_listeners);
 	if (!rt || !socket)
 		return;
-	snprintf(hypr_sig, sizeof hypr_sig, "gluewc-%s", socket);
+	snprintf(hypr_sig, sizeof hypr_sig, "phonegluewc-%s", socket);
 	snprintf(base, sizeof base, "%s/hypr", rt);
 	mkdir(base, 0700);
 	snprintf(hypr_dir, sizeof hypr_dir, "%s/%s", base, hypr_sig);

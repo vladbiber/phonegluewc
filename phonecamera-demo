@@ -1,0 +1,90 @@
+#!/bin/sh
+# Starts dynamic camera activities in the run-on-laptop.sh window, from another terminal; only touches that window's pretend state.
+here=$(cd "$(dirname "$0")" && pwd)
+BASE=${PHONE_LAPTOP_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/phonegluewc-laptop}
+export PHONECAMERA_SOCK="$BASE/camera.sock" DBUS_SESSION_BUS_ADDRESS="unix:path=$BASE/bus" FAKE_STATE="$BASE/fake" XDG_CONFIG_HOME="$BASE/config"
+PATH="$here:$BASE/fakebin:$PATH"
+[ -S "$PHONECAMERA_SOCK" ] || { echo "start ./run-on-laptop.sh first, with the feature on"; exit 1; }
+bat=$BASE/sys/power_supply/BAT0
+set_key() { "$here/settings/pset" set phone "$1" "$2"; }
+toggle() { [ "$(cat "$FAKE_STATE/$1" 2>/dev/null)" = "$2" ] && echo "$3" >"$FAKE_STATE/$1" || echo "$2" >"$FAKE_STATE/$1"; phonecamera poll; }
+case ${1:-} in
+music)
+	exec python3 "$here/tests/fake-player.py" "$here/settings/phonesettings.svg" ;;
+call)
+	echo "Answer or decline in the window; ends when this does"
+	phonecamera post --id call --kind call --state incoming --title "Alex Sample" --wait | while read -r e; do
+		case $e in
+		*answer*) phonecamera update --id call --state active --elapsed ;;
+		*decline* | *hangup*) phonecamera end call; break ;;
+		*mute*) m=$((1 - ${m:-0})); phonecamera update --id call --muted $m ;;
+		*speaker*) v=$((1 - ${v:-0})); phonecamera update --id call --speaker $v ;;
+		esac
+	done ;;
+charging)
+	[ "$(cat "$bat/status")" = Charging ] && echo Discharging >"$bat/status" || echo Charging >"$bat/status"
+	phonecamera poll ;;
+lowbat)
+	echo Discharging >"$bat/status"
+	if [ "$(cat "$bat/capacity")" -le 15 ]; then echo 62 >"$bat/capacity"; else echo 14 >"$bat/capacity"; fi
+	phonecamera poll ;;
+record)
+	echo "Pull the quick settings down in the window and tap Screen record: a pretend recorder runs, no file is written" ;;
+timer) phonecamera timer "${2:-65}" ;;
+stopwatch) phonecamera stopwatch ;;
+cancel) phonecamera cancel timer; phonecamera cancel stopwatch ;;
+nav)
+	phonecamera post --id nav --kind nav --icon navr --head "In 200 m" --title "Turn right" --text "Strada Sample" --tail "200 m" --ttl 600
+	sleep "${2:-30}" ;;
+flashlight)
+	f=$BASE/leds/white:torch/brightness
+	[ "$(cat "$f")" = 0 ] && echo 1 >"$f" || echo 0 >"$f"
+	phonecamera poll ;;
+ringer)
+	case $(grep -s '^ringer=' "$XDG_CONFIG_HOME/phonegluewc/phone.conf") in
+	ringer=vibrate) set_key ringer silent ;;
+	ringer=silent) set_key ringer normal ;;
+	*) set_key ringer vibrate ;;
+	esac ;;
+dnd)
+	grep -qsx 'dnd=on' "$XDG_CONFIG_HOME/phonegluewc/phone.conf" && set_key dnd off || set_key dnd on ;;
+volume)
+	wpctl set-volume @DEFAULT_AUDIO_SINK@ "${2:-$(( $(date +%s) % 90 + 5 ))}%"
+	phonecamera poll ;;
+brightness)
+	echo "${2:-$(( $(date +%s) % 90 + 5 ))}" >"$BASE/sys/backlight/laptop-fake/brightness"
+	phonecamera poll ;;
+hotspot) toggle hotspot on off ;;
+vpn) toggle vpn on off ;;
+earbuds)
+	bluetoothctl disconnect 00:00:00:00:00:02 >/dev/null
+	phonecamera poll; sleep 2
+	bluetoothctl connect 00:00:00:00:00:02 >/dev/null
+	phonecamera poll ;;
+mic) toggle micuse 1 0 ;;
+camera)
+	: >"$BASE/sys/fake-video"
+	toggle camuse 1 0 ;;
+transfer)
+	for p in 0.1 0.25 0.4 0.55 0.7 0.85 1; do
+		if [ "$p" = 0.1 ]; then
+			phonecamera post --id tr --kind transfer --icon transfer --head Transfer --title "holiday.zip" --text "To Sample Phone" --progress $p
+		else
+			phonecamera update --id tr --progress $p
+		fi
+		sleep 1
+	done ;;
+live)
+	echo "Its buttons print here; ends when this does"
+	phonecamera post --id live --icon note --head "Sample app" --title "Your order" --text "Arrives in 12 minutes" --tail "12 min" --progress 0.6 --button done:Got\ it --button later:Later --wait ;;
+notify)
+	notify-send -a "Sample Chat" "Alex Sample" "${2:-Are you coming tonight?}" ;;
+*)
+	echo "usage: phonecamera-demo ACTIVITY"
+	echo "  music call timer [SECONDS] stopwatch cancel nav [SECONDS] transfer live notify [TEXT] record"
+	echo "  each toggles: charging lowbat flashlight ringer dnd hotspot vpn mic camera"
+	echo "  one change: volume [PCT] brightness [PCT] earbuds"
+	echo "  the lock: F6 in the window locks, and the unlock animation runs when you unlock; F5 with F6 takes a screenshot"
+	echo "  two at once: start two of them, in two terminals if they stay running"
+	[ -z "${1:-}" ] || exit 2 ;;
+esac

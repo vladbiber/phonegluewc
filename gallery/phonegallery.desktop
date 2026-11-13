@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Gallery
+Comment=Photos you took
+Exec=phonegallery %f
+Icon=phonegallery
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=gallery;photos;pictures;images;
+MimeType=image/jpeg;image/png;image/webp;

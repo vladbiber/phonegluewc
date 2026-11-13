@@ -1,0 +1,205 @@
+--- a/arch/arm64/boot/dts/qcom/sm7325-nothing-spacewar.dts
++++ b/arch/arm64/boot/dts/qcom/sm7325-nothing-spacewar.dts
+@@ -36,6 +36,37 @@
+ 		wifi0 = &wifi;
+ 	};
+ 
++	wcd9385: audio-codec {
++		compatible = "qcom,wcd9385-codec";
++
++		pinctrl-0 = <&wcd_reset_n>;
++		pinctrl-1 = <&wcd_reset_n_sleep>;
++		pinctrl-names = "default", "sleep";
++
++		reset-gpios = <&tlmm 83 GPIO_ACTIVE_LOW>;
++
++		vdd-rxtx-supply = <&vreg_l18b_1p8>;
++		vdd-io-supply = <&vreg_l18b_1p8>;
++		vdd-buck-supply = <&vreg_l17b_1p8>;
++		vdd-mic-bias-supply = <&vreg_bob>;
++
++		/* Values of the stock device tree */
++		qcom,micbias1-microvolt = <2750000>;
++		qcom,micbias2-microvolt = <2700000>;
++		qcom,micbias3-microvolt = <2750000>;
++		qcom,micbias4-microvolt = <2750000>;
++
++		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000 500000
++							  500000 500000 500000>;
++		qcom,mbhc-headset-vthreshold-microvolt = <1700000>;
++		qcom,mbhc-headphone-vthreshold-microvolt = <50000>;
++
++		qcom,rx-device = <&wcd_rx>;
++		qcom,tx-device = <&wcd_tx>;
++
++		#sound-dai-cells = <1>;
++	};
++
+ 	chosen {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+@@ -1085,6 +1116,50 @@
+ 	/delete-property/ power-domains;
+ };
+ 
++&lpass_rx_macro {
++	status = "okay";
++};
++
++&lpass_rx_swr_clk {
++	drive-strength = <2>;
++	slew-rate = <1>;
++	bias-disable;
++};
++
++&lpass_rx_swr_data {
++	drive-strength = <2>;
++	slew-rate = <1>;
++	bias-bus-hold;
++};
++
++&lpass_tx_macro {
++	compatible = "qcom,sm7325-lpass-tx-macro",
++		     "qcom,sm8450-lpass-tx-macro";
++
++	status = "okay";
++};
++
++&lpass_tx_swr_clk {
++	drive-strength = <2>;
++	slew-rate = <1>;
++	bias-disable;
++};
++
++&lpass_tx_swr_data {
++	drive-strength = <2>;
++	slew-rate = <1>;
++	bias-bus-hold;
++};
++
++&lpass_va_macro {
++	vdd-micb-supply = <&vreg_bob>;
++
++	/* No DMIC on this phone */
++	qcom,dmic-sample-rate = <4800000>;
++
++	status = "okay";
++};
++
+ &mdss {
+ 	status = "okay";
+ };
+@@ -1333,6 +1408,10 @@
+ 		reg = <PRIMARY_MI2S_RX>;
+ 		qcom,sd-lines = <1>;
+ 	};
++
++	dai@120 {
++		reg = <TX_CODEC_DMA_TX_3>;
++	};
+ };
+ 
+ &q6asmdai {
+@@ -1395,6 +1474,16 @@
+ 	pinctrl-names = "default",
+ 			"sleep";
+ 
++	audio-routing = "AMIC1", "MIC BIAS1",
++			"AMIC2", "MIC BIAS2",
++			"AMIC3", "MIC BIAS3",
++			"AMIC4", "MIC BIAS1",
++			"AMIC5", "MIC BIAS4",
++			"TX SWR_INPUT0", "ADC1_OUTPUT",
++			"TX SWR_INPUT1", "ADC2_OUTPUT",
++			"TX SWR_INPUT4", "ADC3_OUTPUT",
++			"TX SWR_INPUT5", "ADC4_OUTPUT";
++
+ 	mm1-dai-link {
+ 		link-name = "MultiMedia1";
+ 
+@@ -1403,6 +1492,38 @@
+ 		};
+ 	};
+ 
++	mm2-dai-link {
++		link-name = "MultiMedia2";
++
++		cpu {
++			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
++		};
++	};
++
++	mm3-dai-link {
++		link-name = "MultiMedia3";
++
++		cpu {
++			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA3>;
++		};
++	};
++
++	wcd-capture-dai-link {
++		link-name = "WCD Capture";
++
++		cpu {
++			sound-dai = <&q6afedai TX_CODEC_DMA_TX_3>;
++		};
++
++		platform {
++			sound-dai = <&q6routing>;
++		};
++
++		codec {
++			sound-dai = <&wcd9385 1>, <&swr1 0>, <&lpass_tx_macro 0>;
++		};
++	};
++
+ 	i2s-dai-link {
+ 		link-name = "I2S Playback";
+ 
+@@ -1456,6 +1577,26 @@
+ 	};
+ };
+ 
++&swr0 {
++	status = "okay";
++
++	wcd_rx: codec@0,4 {
++		compatible = "sdw20217010d00";
++		reg = <0 4>;
++		qcom,rx-port-mapping = <1 2 3 4 5>;
++	};
++};
++
++&swr1 {
++	status = "okay";
++
++	wcd_tx: codec@0,3 {
++		compatible = "sdw20217010d00";
++		reg = <0 3>;
++		qcom,tx-port-mapping = <1 2 3 4>;
++	};
++};
++
+ &tlmm {
+ 	/* 56-59: Fingerprint reader (SPI) */
+ 	gpio-reserved-ranges = <56 4>;
+@@ -1606,6 +1747,19 @@
+ 		drive-strength = <8>;
+ 		bias-pull-up;
+ 	};
++
++	wcd_reset_n: wcd-reset-n-state {
++		pins = "gpio83";
++		function = "gpio";
++		drive-strength = <16>;
++	};
++
++	wcd_reset_n_sleep: wcd-reset-n-sleep-state {
++		pins = "gpio83";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-disable;
++	};
+ };
+ 
+ &uart5 {

@@ -1,0 +1,9 @@
+#!/bin/sh
+# phonegallery [photo]: opens the gallery, on that photo if given, or brings the running one to it.
+d=$(dirname "$(readlink -f "$0")")
+[ -f "$d/shell.qml" ] || d=$d/../share/phonegluewc/gallery
+p=${1:-}
+[ -n "$p" ] && p=$(readlink -f -- "$p")
+qs ipc -p "$d" call gallery open "$p" >/dev/null 2>&1 && exit 0
+[ -n "$p" ] && [ -z "${PHONEGALLERY_DIR:-}" ] && export PHONEGALLERY_DIR="${p%/*}"
+PHONEGALLERY_OPEN=$p exec qs -p "$d"

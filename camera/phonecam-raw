@@ -1,0 +1,122 @@
+#!/usr/bin/python3 -I
+"""phonecam-raw CAMERA MODE FRAMES EXPOSURE_US GAIN OUT.raw
+
+Grabs FRAMES packed RAW10 frames straight from V4L2 (no libcamera), back to back in OUT.raw,
+and prints "W H STRIDE ROT BAYER CCM" for phonecam-develop. CAMERA MODE: back full | back bin | front full.
+The viewfinder must be stopped first; the sensor is set up from scratch.
+"""
+import os
+import re
+import subprocess
+import sys
+
+MEDIA = "/dev/media0"
+# sensor entity, csiphy, sizes per mode, rotation of the developed image, bus orders a driver gets wrong -> real one,
+# colour matrix, gain multiplier -> code -> multiplier
+SENSORS = {
+    "back": ("s5kjn1 18-002d", "msm_csiphy2", {"full": (8160, 6144), "bin": (4080, 3072)}, 270, {}, "s5kjn1",
+             lambda m: m, lambda c: c),
+    "front": ("imx471 16-001a", "msm_csiphy0", {"full": (2304, 1728)}, 90,
+              {"GRBG": "RGGB"}, "none",  # the old driver said GRBG; plane means under warm light say RGGB
+              lambda m: 1024 - 1024 / m, lambda c: 1024 / (1024 - c)),
+}
+FOURCC = {"GRBG": "pgAA", "RGGB": "pRAA", "BGGR": "pBAA", "GBRG": "pGAA"}  # packed 10-bit
+PHYS = ["msm_csiphy%d" % i for i in range(5)]
+
+
+def run(*cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def ctrls(dev):
+    out = {}
+    for m in re.finditer(r"^\s*(\w+) 0x\w+ \((\w+)\)\s*: min=(-?\d+) max=(-?\d+).*?value=(-?\d+)", run("v4l2-ctl", "-d", dev, "-l"), re.M):
+        out[m[1]] = (int(m[3]), int(m[4]), int(m[5]))
+    return out
+
+
+def line_us(c, width):
+    return (width + c["horizontal_blanking"][2]) / c["pixel_rate"][2] * 1e6
+
+
+def viewfinder(camera):
+    """Exposure (us) and gain multiplier the running viewfinder's AGC chose."""
+    ent, *_, to_mult = SENSORS[camera]
+    sub = run("media-ctl", "-d", MEDIA, "-e", ent).strip()
+    c = ctrls(sub)
+    w = int(re.search(r"/(\d+)x", run("media-ctl", "-d", MEDIA, "--get-v4l2", f'"{ent}":0'))[1])
+    return c["exposure"][2] * line_us(c, w), to_mult(c["analogue_gain"][2])
+
+
+def set_fps(camera, fps):
+    """Frame rate of the running stream, by stretching the vertical blanking."""
+    ent = SENSORS[camera][0]
+    sub = run("media-ctl", "-d", MEDIA, "-e", ent).strip()
+    c = ctrls(sub)
+    w, h = map(int, re.search(r"/(\d+)x(\d+)", run("media-ctl", "-d", MEDIA, "--get-v4l2", f'"{ent}":0')).groups())
+    vmin, vmax, _ = c["vertical_blanking"]
+    vb = min(vmax, max(vmin, blanking(c["pixel_rate"][2], w + c["horizontal_blanking"][2], h, fps)))
+    run("v4l2-ctl", "-d", sub, "-c", f"vertical_blanking={vb}")
+
+
+def blanking(pixel_rate, line, height, fps):
+    return round(pixel_rate / line / fps) - height
+
+
+def capture(camera, mode, frames, exp_us, gain, out):
+    ent, phy, sizes, rot, wrong, ccm, to_code, _ = SENSORS[camera]
+    w, h = sizes[mode]
+    links = [f'"{p}":1->"msm_csid0":0[{int(p == phy)}]' for p in PHYS if p != phy] + [f'"{phy}":1->"msm_csid0":0[1]']
+    run("media-ctl", "-d", MEDIA, "-l", ",".join(links))
+    # bus code as the driver reports it, so a driver fixed to its real Bayer order keeps working
+    code = re.search(r"fmt:(S\w+10_1X10)/", run("media-ctl", "-d", MEDIA, "--get-v4l2", f'"{ent}":0'))[1]
+    bayer = wrong.get(code[1:5], code[1:5])
+    f = f"{code}/{w}x{h} field:none"
+    # one -V with a list: media-ctl keeps only the last -V given
+    run("media-ctl", "-d", MEDIA, "-V", ",".join(f'"{e}":0[fmt:{f}]' for e in (ent, phy, "msm_csid0", "msm_vfe0_rdi0")))
+    sub = run("media-ctl", "-d", MEDIA, "-e", ent).strip()
+    vid = run("media-ctl", "-d", MEDIA, "-e", "msm_vfe0_video0").strip()
+
+    # format first: it resets exposure
+    fmt = run("v4l2-ctl", "-d", vid, f"--set-fmt-video=width={w},height={h},pixelformat={FOURCC[code[1:5]]}", "--get-fmt-video")
+    stride = int(re.search(r"Bytes per Line\s*:\s*(\d+)", fmt)[1])
+    c = ctrls(sub)
+    lines = max(c["exposure"][0], round(exp_us / line_us(c, w)))
+    vmin, vmax, _ = c["vertical_blanking"]
+    vb = min(vmax, max(vmin, lines + 16 - h))
+    run("v4l2-ctl", "-d", sub, "-c", f"vertical_blanking={vb}")
+    c = ctrls(sub)  # exposure max follows the frame length
+    lines = min(lines, c["exposure"][1])
+    gmin, gmax, _ = c["analogue_gain"]
+    code = int(min(gmax, max(gmin, round(to_code(max(gain, 1.0))))))
+    run("v4l2-ctl", "-d", sub, "-c", f"exposure={lines},analogue_gain={code}")
+
+    size = stride * h
+    skip = 2  # the first frames still carry the old exposure
+    tmp = out + ".part"
+    r = subprocess.run(["v4l2-ctl", "-d", vid, "--stream-mmap=3", f"--stream-count={frames + skip}", f"--stream-to={tmp}"],
+                       capture_output=True, text=True, timeout=30 + frames * 3)
+    if os.path.getsize(tmp) < (frames + skip) * size:
+        os.unlink(tmp)
+        sys.exit("phonecam-raw: stream failed: " + (r.stderr or r.stdout).strip()[-200:])
+    with open(tmp, "rb") as src, open(out, "wb") as dst:
+        src.seek(skip * size)
+        while chunk := src.read(size):
+            dst.write(chunk)
+    os.unlink(tmp)
+    print(w, h, stride, rot, bayer, ccm)
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    assert blanking(560000000, 4352, 3072, 30) == 1217 and blanking(560000000, 4352, 3072, 24) == 2290
+    if a[:1] == ["--fps"] and len(a) == 3:
+        set_fps(a[1], float(a[2]))
+    elif a[:1] == ["--viewfinder"] and len(a) == 2:
+        e, g = viewfinder(a[1])
+        print(f"{e:.0f} {g:.3f}")
+    elif len(a) == 6 and a[0] in SENSORS and a[1] in SENSORS[a[0]][2]:
+        capture(a[0], a[1], int(a[2]), float(a[3]), float(a[4]), a[5])
+    else:
+        sys.exit(__doc__.strip() + "\n       phonecam-raw --viewfinder CAMERA   prints EXPOSURE_US GAIN"
+                 "\n       phonecam-raw --fps CAMERA FPS      sets the running stream's frame rate")

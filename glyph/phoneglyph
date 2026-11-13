@@ -1,0 +1,208 @@
+#!/usr/bin/python3 -I
+"""Glyph lights (AW21018 on i2c-1 @0x20, enable = tlmm gpio18) for Nothing Phone (1).
+
+phoneglyph on [PCT] | off | toggle | brightness PCT | zone NAME PCT | pattern NAME | status
+zones: camera slash ring ring1..ring4 line line1..line8 dot rec
+patterns: breathe pulse chase spin notify
+"""
+import fcntl, json, math, os, signal, subprocess, sys, time
+
+BUS, ADDR, I2C_SLAVE = "/dev/i2c-1", 0x20, 0x0703
+STATE_DIR = "/run/phoneglyph"
+STATE = STATE_DIR + "/state.json"
+PIDFILE = STATE_DIR + "/pattern.pid"
+
+# channel numbers (1-based) from Nothing's leds_aw210xx.c
+RING = [2, 3, 4, 5]
+LINE = [13, 11, 9, 12, 10, 14, 15, 8]  # top to bottom
+ZONES = {"camera": [7], "slash": [1], "ring": RING, "line": LINE, "dot": [16], "rec": [17]}
+ZONES.update({f"ring{i+1}": [c] for i, c in enumerate(RING)})
+ZONES.update({f"line{i+1}": [c] for i, c in enumerate(LINE)})
+WHITE = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # stock "all white" skips 6, 17 (red), 18
+
+# stock PVT calibration: per-channel scaling and global current (do not raise, LED current limit)
+SL = [0x50, 0xBD, 0xBD, 0xBF, 0xBF, 0x00, 0xE9, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x2A, 0x00]
+GCCR = 0xA0
+
+REG_GCR, REG_BR00L, REG_UPDATE, REG_SL00 = 0x20, 0x21, 0x45, 0x46
+REG_GCCR, REG_UVCR, REG_GCR2, REG_RESET, REG_GCFG = 0x58, 0x60, 0x61, 0x70, 0x8B
+GCR_ON = 0x85  # APSE | 16MHz osc | 12-bit PWM | CHIPEN
+CHIPID = 0x02
+
+
+def pct_to_raw(p):
+    p = max(0.0, min(100.0, float(p)))
+    return round(4095 * (p / 100.0) ** 2.2)  # perceptual curve
+
+
+class Chip:
+    def __init__(self):
+        self.fd = os.open(BUS, os.O_RDWR)
+        fcntl.ioctl(self.fd, I2C_SLAVE, ADDR)
+
+    def w(self, reg, val):
+        os.write(self.fd, bytes([reg, val & 0xFF]))
+
+    def r(self, reg):
+        os.write(self.fd, bytes([reg]))
+        return os.read(self.fd, 1)[0]
+
+    def init(self):
+        cid = self.r(REG_RESET)
+        if cid != CHIPID:
+            sys.exit(f"phoneglyph: unexpected chip id 0x{cid:02x}")
+        self.w(REG_GCR, GCR_ON)
+        self.w(REG_GCR2, 0x00)
+        self.w(REG_GCCR, GCCR)
+        self.w(REG_UVCR, self.r(REG_UVCR) | 0x03)
+        self.w(REG_GCFG, 0x40)
+        for i, v in enumerate(SL):
+            self.w(REG_SL00 + i, v)
+
+    def set(self, levels):
+        """levels: {channel: raw 0..4095}; latched together by UPDATE."""
+        for ch, raw in levels.items():
+            self.w(REG_BR00L + (ch - 1) * 2, raw & 0xFF)
+            self.w(REG_BR00L + (ch - 1) * 2 + 1, (raw >> 8) & 0x0F)
+        self.w(REG_UPDATE, 0x00)
+
+
+def gpio(v):
+    subprocess.run(["gpioset", "-c", "gpiochip4", "-t0", f"18={v}"], check=True)
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"on": False, "brightness": 60, "zones": {}}
+
+
+def save(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(st, f)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def stop_pattern():
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read())
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            os.kill(pid, 0)
+            time.sleep(0.02)
+    except (OSError, ValueError):
+        pass
+    try:
+        os.unlink(PIDFILE)
+    except OSError:
+        pass
+
+
+def power_on():
+    gpio(1)
+    time.sleep(0.003)
+    c = Chip()
+    c.init()
+    return c
+
+
+def apply_static(st):
+    c = power_on()
+    base = pct_to_raw(st["brightness"])
+    lv = {ch: base for ch in WHITE}
+    for z, p in st["zones"].items():
+        for ch in ZONES[z]:
+            lv[ch] = pct_to_raw(p)
+    lv.setdefault(17, 0)
+    c.set(lv)
+
+
+def power_off():
+    try:
+        c = Chip()
+        c.set({ch: 0 for ch in range(1, 19)})
+        c.w(REG_GCR, GCR_ON & ~0x01)
+    except OSError:
+        pass
+    gpio(0)
+
+
+def pattern(name, st):
+    stop_pattern()
+    c = power_on()
+    peak = st["brightness"]
+    frames = {
+        "breathe": lambda t: {ch: pct_to_raw(peak * (0.5 - 0.5 * math.cos(t * 2 * math.pi / 3))) for ch in WHITE},
+        "pulse": lambda t: {ch: pct_to_raw(peak if (t % 1.2) < 0.15 else 0) for ch in WHITE},
+        "chase": lambda t: {**{ch: 0 for ch in WHITE},
+                            **{LINE[int(t * 10) % len(LINE)]: pct_to_raw(peak)}},
+        "spin": lambda t: {**{ch: 0 for ch in WHITE},
+                           **{RING[int(t * 6) % len(RING)]: pct_to_raw(peak)}},
+        "notify": lambda t: {ch: pct_to_raw(peak if int(t * 8) % 4 in (0, 2) and t % 2 < 0.5 else 0) for ch in WHITE},
+    }
+    if name not in frames:
+        sys.exit(f"phoneglyph: patterns: {' '.join(frames)}")
+    if os.fork():
+        return
+    os.setsid()
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    running = [True]
+    signal.signal(signal.SIGTERM, lambda *_: running.__setitem__(0, False))
+    t0 = time.monotonic()
+    while running[0]:
+        c.set(frames[name](time.monotonic() - t0))
+        time.sleep(1 / 30)
+    os._exit(0)
+
+
+def main(a):
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", "-n", os.path.abspath(sys.argv[0])] + a)
+    st = load()
+    cmd = a[0] if a else "status"
+    if cmd == "status":
+        st["pattern"] = os.path.exists(PIDFILE)
+        print(json.dumps(st))
+        return
+    if cmd == "toggle":
+        cmd = "off" if st["on"] else "on"
+    if cmd == "off":
+        stop_pattern()
+        power_off()
+        st["on"] = False
+    elif cmd in ("on", "brightness"):
+        if len(a) > 1:
+            st["brightness"] = max(0, min(100, int(a[1])))
+        elif cmd == "brightness":
+            sys.exit("usage: phoneglyph brightness 0-100")
+        if cmd == "on" or st["on"]:
+            stop_pattern()
+            st["on"] = True
+            apply_static(st)
+    elif cmd == "zone" and len(a) == 3 and a[1] in ZONES:
+        st["zones"][a[1]] = max(0, min(100, int(a[2])))
+        st["on"] = True
+        stop_pattern()
+        apply_static(st)
+    elif cmd == "pattern" and len(a) == 2:
+        st["on"] = True
+        save(st)
+        pattern(a[1], st)
+    elif cmd == "reset":
+        st["zones"] = {}
+        if st["on"]:
+            stop_pattern()
+            apply_static(st)
+    else:
+        sys.exit(__doc__.strip())
+    save(st)
+
+
+if __name__ == "__main__":
+    assert pct_to_raw(0) == 0 and pct_to_raw(100) == 4095 and pct_to_raw(150) == 4095
+    main(sys.argv[1:])

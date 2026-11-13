@@ -1,0 +1,2 @@
+# PM8350B HV haptics (qcom-hv-haptics-lite): seat user access + feedbackd vibra
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", SUBSYSTEMS=="input", ATTRS{name}=="pm8350b-haptics", TAG+="uaccess", ENV{FEEDBACKD_TYPE}="vibra"

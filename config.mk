@@ -34,13 +34,11 @@ SCENEFX_LIBS = `$(PKG_CONFIG) --libs scenefx-0.5`
 #	-I$(PWD)/wlroots/0.20/include/wlroots-0.20
 #WLR_LIBS = -Wl,-rpath,$(PWD)/wlroots/0.20/lib64 -L$(PWD)/wlroots/0.20/lib64 -lwlroots-0.20
 
-XWAYLAND = -DXWAYLAND
-XLIBS = xcb xcb-icccm
 # Uncomment to build XWayland support
 #XWAYLAND = -DXWAYLAND
 #XLIBS = xcb xcb-icccm
 
-# gluewc itself only uses C99 features, but wlroots' headers use anonymous unions (C11).
+# phonegluewc itself only uses C99 features, but wlroots' headers use anonymous unions (C11).
 # To avoid warnings about them, we do not use -std=c99 and instead of using the
 # gmake default 'CC=c99', we use cc.
 CC = cc

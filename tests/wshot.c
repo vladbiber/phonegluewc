@@ -13,6 +13,7 @@ static struct wl_output *output;
 static int want_output, seen_outputs;
 static struct zwlr_screencopy_manager_v1 *mgr;
 static struct wl_buffer *buf;
+static int bgr;
 static void *bufdata;
 static uint32_t bw, bh, bstride;
 static int done, failed;
@@ -42,6 +43,7 @@ static void fbuffer(void *d, struct zwlr_screencopy_frame_v1 *f,
 	bufdata = mmap(NULL, (size_t)stride * height, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	pool = wl_shm_create_pool(shm, fd, (int)(stride * height));
 	buf = wl_shm_pool_create_buffer(pool, 0, (int)width, (int)height, (int)stride, format);
+	bgr = format == WL_SHM_FORMAT_XBGR8888 || format == WL_SHM_FORMAT_ABGR8888;
 	bw = width; bh = height; bstride = stride;
 	zwlr_screencopy_frame_v1_copy(f, buf);
 }
@@ -76,7 +78,7 @@ int main(int argc, char *argv[])
 	for (y = 0; y < bh; y++) {
 		unsigned char *row = (unsigned char *)bufdata + (size_t)y * bstride;
 		for (x = 0; x < bw; x++) {
-			unsigned char px[3] = { row[x * 4 + 2], row[x * 4 + 1], row[x * 4] };
+			unsigned char px[3] = { row[x * 4 + (bgr ? 0 : 2)], row[x * 4 + 1], row[x * 4 + (bgr ? 2 : 0)] };
 			fwrite(px, 1, 3, out);
 		}
 	}

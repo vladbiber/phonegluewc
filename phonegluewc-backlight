@@ -1,0 +1,63 @@
+#!/bin/sh
+# phonegluewc-backlight: step the backlight up or down on a ladder that is fine at
+# the bottom and coarse above it: 0 1 2 ... 10 15 20 ... 100. A plain 5% step
+# can never reach 0 and jumps too far when the room is dark. Uses brightnessctl
+# when it is installed and light otherwise. Some panels (NVIDIA backlight on
+# MUX laptops) stay lit at 0, so 0 also powers the built-in panel off.
+
+usage() { printf 'usage: phonegluewc-backlight up|down\n' >&2; exit 2; }
+[ $# -eq 1 ] || usage
+case $1 in up|down) ;; *) usage ;; esac
+
+if command -v brightnessctl >/dev/null 2>&1; then
+	get() { brightnessctl -m | awk -F, 'NR==1 { printf "%d %d\n", $3, $5 }'; }
+	put() { brightnessctl -q -n0 set "$1%"; }
+elif command -v light >/dev/null 2>&1; then
+	get() { light -G | awk '{ printf "%d 100\n", $1 + 0.5 }'; }
+	put() { light -S "$1"; }
+else
+	printf 'phonegluewc-backlight: neither brightnessctl nor light is installed\n' >&2
+	exit 1
+fi
+
+# built-in panel as phonegluewc names it: card1-eDP-1 -> eDP-1
+panel() {
+	for c in /sys/class/drm/card*-eDP-* /sys/class/drm/card*-LVDS-* /sys/class/drm/card*-DSI-*; do
+		[ "$(cat "$c/status" 2>/dev/null)" = connected ] || continue
+		c=${c##*/}
+		echo "${c#card*-}"
+		return
+	done
+}
+power() {
+	command -v phonegluewc-msg >/dev/null 2>&1 && [ -n "$WAYLAND_DISPLAY" ] || return 0
+	p=$(panel)
+	[ -n "$p" ] && phonegluewc-msg -o "$p" power "$1" 2>/dev/null
+}
+
+set -- "$1" $(get)
+cur=$2; max=$3
+[ "$max" -gt 0 ] 2>/dev/null || exit 1
+pct=$(( (cur * 100 + max / 2) / max ))
+
+if [ "$1" = down ]; then
+	if [ "$pct" -le 10 ]; then t=$((pct - 1)); else t=$(( (pct - 1) / 5 * 5 )); fi
+else
+	if [ "$pct" -lt 10 ]; then t=$((pct + 1)); else t=$(( (pct / 5 + 1) * 5 )); fi
+fi
+[ "$t" -lt 0 ] && t=0
+[ "$t" -gt 100 ] && t=100
+
+# Panels with only a handful of levels can round a 1% step back onto the
+# level they are on; keep stepping until the hardware value actually moves.
+while :; do
+	put "$t"
+	set -- "$1" $(get)
+	[ "$2" -ne "$cur" ] && break
+	[ "$t" -le 0 ] || [ "$t" -ge 100 ] && break
+	if [ "$1" = down ]; then t=$((t - 1)); else t=$((t + 1)); fi
+done
+
+if [ "$t" -eq 0 ]; then power off
+elif [ "$1" = up ] && [ "$pct" -eq 0 ]; then power on
+fi

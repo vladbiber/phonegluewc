@@ -1,0 +1,30 @@
+#!/bin/sh
+# phonetext-translate FROM TO: one block per line in, one translated line out; offline
+# A pair without its own model goes through English, one model in memory at a time.
+d=${PHONETEXT_MODELS:-${XDG_DATA_HOME:-$HOME/.local/share}/phonegluewc/translate}
+for c in "$1" "$2"; do
+	case "$c" in
+	"" | *[!a-zA-Z-]*) echo "usage: phonetext-translate FROM TO" >&2; exit 2 ;;
+	esac
+done
+cli=$d/slimt-cli
+[ -x "$cli" ] || cli=$(command -v slimt-cli) || exit 127
+have() { [ -r "$d/$1-$2/model" ] || [ -r "$d/model.$1$2.intgemm.alphas.bin" ]; }
+# the cli prints four lines of settings first and an empty line last; older models write ș ț with cedillas
+one() {
+	if [ -r "$d/$1-$2/model" ]; then
+		n=$(cat "$d/$1-$2/layers" 2>/dev/null)
+		case "$n" in "" | *[!0-9]*) n=2 ;; esac
+		"$cli" --root "$d/$1-$2" --model model --vocabulary vocab --shortlist lex --decoder-layers "$n" 2>/dev/null | sed '1,4d;$d;s/ţ/ț/g;s/ş/ș/g;s/Ţ/Ț/g;s/Ş/Ș/g'
+	else
+		"$cli" --root "$d" --model "model.$1$2.intgemm.alphas.bin" --vocabulary "vocab.$1$2.spm" \
+			--shortlist "lex.50.50.$1$2.s2t.bin" 2>/dev/null | sed '1,4d;$d;s/ţ/ț/g;s/ş/ș/g;s/Ţ/Ț/g;s/Ş/Ș/g'
+	fi
+}
+if have "$1" "$2"; then
+	one "$1" "$2"
+elif [ "$1" != en ] && [ "$2" != en ] && have "$1" en && have en "$2"; then
+	out=$(one "$1" en) && [ -n "$out" ] && printf '%s\n' "$out" | one en "$2"
+else
+	exit 127
+fi

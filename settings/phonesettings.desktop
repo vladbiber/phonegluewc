@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+Comment=Wi-Fi, Bluetooth, display, sound and more
+Exec=phonesettings
+Icon=phonesettings
+Terminal=false
+Categories=Settings;

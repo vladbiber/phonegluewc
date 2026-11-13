@@ -1,0 +1,71 @@
+#!/usr/bin/python3 -I
+"""phonegallery-play CLIP.mp4: plays one camera clip full screen. Tap pauses, the end or a closed window stops it."""
+import sys
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gtk, Gst, Gio, GLib
+
+Gst.init(None)
+
+
+def pipeline(path):
+    # the decoder is named, never auto-picked: the hardware one (qcom-iris) can take the whole phone down
+    desc = (f'filesrc location="{path}" ! qtdemux name=d d.video_0 ! queue ! h264parse ! openh264dec'
+            " ! videoflip video-direction=auto ! videoconvert ! gtk4paintablesink name=sink")
+    p = Gst.parse_launch(desc)
+    # sound only when the clip has it; the pad shows up while the file is being read
+    def pad(demux, new):
+        if new.get_name().startswith("audio"):
+            tail = Gst.parse_bin_from_description("queue ! decodebin ! audioconvert ! audioresample ! autoaudiosink", True)
+            p.add(tail)
+            tail.sync_state_with_parent()
+            new.link(tail.get_static_pad("sink"))
+    p.get_by_name("d").connect("pad-added", pad)
+    return p
+
+
+def main(path):
+    app = Gtk.Application(application_id="org.phonegluewc.GalleryPlayer", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(a):
+        win = Gtk.ApplicationWindow(application=a, title="Video")
+        css = Gtk.CssProvider()
+        css.load_from_data(b"window { background: black; }")
+        Gtk.StyleContext.add_provider_for_display(win.get_display(), css, 800)
+        try:
+            p = pipeline(path)
+        except GLib.Error as e:
+            sys.exit(f"phonegallery-play: {e.message}")
+        win.set_child(Gtk.Picture(paintable=p.get_by_name("sink").props.paintable))
+        playing = [True]
+
+        def tap(*_):
+            playing[0] = not playing[0]
+            p.set_state(Gst.State.PLAYING if playing[0] else Gst.State.PAUSED)
+
+        def stop(*_):
+            p.set_state(Gst.State.NULL)
+            a.quit()
+
+        click = Gtk.GestureClick()
+        click.connect("released", tap)
+        win.add_controller(click)
+        bus = p.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::eos", stop)
+        bus.connect("message::error", stop)
+        win.connect("close-request", stop)
+        # covered or screen off: nothing keeps decoding
+        win.connect("notify::suspended", lambda w, _: w.props.suspended and playing[0] and tap())
+        win.present()
+        p.set_state(Gst.State.PLAYING)
+
+    app.connect("activate", activate)
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit(__doc__.strip())
+    sys.exit(main(sys.argv[1]))

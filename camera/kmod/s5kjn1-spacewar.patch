@@ -1,0 +1,25 @@
+--- s5kjn1.c.orig	2026-11-12 21:22:30.233861780 +0200
++++ s5kjn1.c	2026-11-12 21:22:30.250969465 +0200
+@@ -1192,6 +1192,11 @@
+ 				       s5kjn1_link_freq_menu,
+ 				       ARRAY_SIZE(s5kjn1_link_freq_menu),
+ 				       &freq_bitmap);
++	/* spacewar DT lists 600MHz; the only mode here runs at 700MHz and reports it */
++	if (ret) {
++		dev_warn(s5kjn1->dev, "DT link frequency ignored, using 700MHz\n");
++		ret = 0;
++	}
+ 
+ endpoint_free:
+ 	v4l2_fwnode_endpoint_free(&bus_cfg);
+@@ -1311,6 +1316,10 @@
+ 				     "failed to get MCLK clock\n");
+ 
+ 	freq = clk_get_rate(s5kjn1->mclk);
++	/* spacewar DT asks 19.2MHz but camcc can do 24MHz, which the register tables need */
++	if (freq != S5KJN1_MCLK_FREQ_24MHZ &&
++	    !clk_set_rate(s5kjn1->mclk, S5KJN1_MCLK_FREQ_24MHZ))
++		freq = clk_get_rate(s5kjn1->mclk);
+ 	if (freq != S5KJN1_MCLK_FREQ_24MHZ)
+ 		return dev_err_probe(s5kjn1->dev, -EINVAL,
+ 				     "MCLK clock frequency %lu is not supported\n",

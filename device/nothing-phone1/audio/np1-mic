@@ -1,0 +1,33 @@
+#!/bin/sh
+# usage: np1-mic bottom|top|back|headset  (routes one analog mic to the capture PCM; as root, with no capture running, also saves it for the next boot)
+A="amixer -q -D hw:0 cset"
+case "$1" in
+bottom)  adc=1 swr=SWR_MIC0 ;;
+top)     adc=4 swr=SWR_MIC5 inp=INP5 ;;
+back)    adc=2 swr=SWR_MIC1 inp=INP3 ;;
+headset) adc=2 swr=SWR_MIC1 inp=INP2 ;;
+*) echo "usage: $0 bottom|top|back|headset" >&2; exit 2 ;;
+esac
+set -e
+# a route change under an open capture stream yields digital silence; PipeWire lets go after 5 s idle
+i=0
+until grep -q closed /proc/asound/card0/pcm2c/sub0/status; do
+	i=$((i + 1)); [ $i -le 10 ] || { echo "capture in use, stop recording first" >&2; exit 1; }
+	sleep 1
+done
+for n in 1 2 3 4; do $A "name=ADC$n Switch" 0; $A "name=ADC${n}_MIXER Switch" 0; done
+$A "name=HDR12 MUX" NO_HDR12
+$A "name=HDR34 MUX" NO_HDR34
+[ -z "$inp" ] || $A "name=ADC$adc MUX" "$inp"
+# ADC_HIFI gives wideband noise on this board
+$A "name=TX$((adc - 1)) MODE" ADC_NORMAL
+$A "name=ADC$adc Volume" 12
+$A "name=ADC${adc}_MIXER Switch" 1
+$A "name=ADC$adc Switch" 1
+# the DSP delivers no data unless DEC0 is the first active decimator
+$A "name=TX DEC0 MUX" SWR_MIC
+$A "name=TX SMIC MUX0" "$swr"
+$A "name=TX_AIF1_CAP Mixer DEC0" 1
+$A "name=TX_DEC0 Volume" 96
+$A "name=MultiMedia3 Mixer TX_CODEC_DMA_TX_3" 1
+[ "$(id -u)" != 0 ] || alsactl store 0

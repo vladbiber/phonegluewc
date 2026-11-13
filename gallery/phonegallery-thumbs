@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+# phonegallery-thumbs SRC CACHE: prints each thumbnail path once it exists, newest photo first; drops stale ones
+import os, sys
+from concurrent.futures import ThreadPoolExecutor
+import gi
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib
+
+SHORT = 384  # short side; a grid cell is about 360 physical px
+EXT = (".jpg", ".jpeg", ".png", ".webp", ".mp4")
+
+
+def key(e):
+    return f"{e.name}@{int(e.stat().st_mtime)}.jpg"
+
+
+def clip_frame(src):
+    """(first frame as RGB array, seconds) of an H.264 MP4. The decoder is named, never auto-picked:
+    the hardware one (qcom-iris) can take the whole phone down."""
+    import numpy as np
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+    Gst.init(None)
+    p = Gst.parse_launch(f'filesrc location="{src}" ! qtdemux ! h264parse ! openh264dec ! videoflip video-direction=auto'
+                         " ! videoconvert ! video/x-raw,format=RGB ! appsink name=a max-buffers=1 sync=false")
+    try:
+        p.set_state(Gst.State.PAUSED)
+        sample = p.get_by_name("a").emit("try-pull-preroll", 5 * Gst.SECOND)
+        if not sample:
+            return None, 0
+        ok, dur = p.query_duration(Gst.Format.TIME)
+        st = sample.get_caps().get_structure(0)
+        w, h = st.get_value("width"), st.get_value("height")
+        buf = sample.get_buffer()
+        ok2, info = buf.map(Gst.MapFlags.READ)
+        frame = np.frombuffer(bytes(info.data), np.uint8).reshape(h, -1)[:, :w * 3].reshape(h, w, 3)
+        buf.unmap(info)
+        return frame, dur / Gst.SECOND if ok else 0
+    finally:
+        p.set_state(Gst.State.NULL)
+
+
+def clock(seconds):
+    return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
+
+
+def make_clip(src, dst):
+    """a clip's thumbnail carries its play mark and length, so the grid needs no second lookup"""
+    import cv2
+    frame, seconds = clip_frame(src)
+    if frame is None:
+        return None
+    k = SHORT / min(frame.shape[:2])
+    im = cv2.cvtColor(cv2.resize(frame, None, fx=k, fy=k, interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2BGR)
+    h, w = im.shape[:2]
+    cx, cy, r = w // 2, h // 2, SHORT // 9
+    shade = im.copy()
+    cv2.circle(shade, (cx, cy), r, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.rectangle(shade, (cx - 60, cy + SHORT // 2 - 54), (cx + 60, cy + SHORT // 2 - 12), (0, 0, 0), -1)
+    im = cv2.addWeighted(shade, .55, im, .45, 0)
+    tri = [(cx - r // 3, cy - r // 2), (cx - r // 3, cy + r // 2), (cx + r // 2, cy)]
+    cv2.fillPoly(im, [__import__("numpy").array(tri)], (255, 255, 255), cv2.LINE_AA)
+    text = clock(seconds)
+    (tw, _th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, .9, 2)
+    cv2.putText(im, text, (cx - tw // 2, cy + SHORT // 2 - 23), cv2.FONT_HERSHEY_SIMPLEX, .9, (255, 255, 255), 2, cv2.LINE_AA)
+    tmp = dst + ".part.jpg"
+    cv2.imwrite(tmp, im, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    os.replace(tmp, dst)
+    return dst
+
+
+def make(src, dst):
+    if src.lower().endswith(".mp4"):
+        try:
+            return make_clip(src, dst)
+        except Exception:  # a clip still being written, a codec this phone cannot decode
+            return None
+    try:
+        _, w, h = GdkPixbuf.Pixbuf.get_file_info(src)
+        k = SHORT / min(w, h)
+        # the jpeg loader decodes at 1/2..1/8 for a small target, so a 50 MP photo stays cheap
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, max(1, round(w * k)), max(1, round(h * k)), False)
+        pb = pb.apply_embedded_orientation()
+        tmp = dst + ".part"
+        pb.savev(tmp, "jpeg", ["quality"], ["85"])
+        os.replace(tmp, dst)
+        return dst
+    except (GLib.Error, TypeError, ZeroDivisionError, OSError):
+        return None
+
+
+def main(src, cache):
+    os.makedirs(cache, exist_ok=True)
+    try:
+        photos = [e for e in os.scandir(src) if e.is_file() and e.name.lower().endswith(EXT)]
+    except OSError:
+        photos = []
+    photos.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+    want = {key(e): e.path for e in photos}
+    for name in os.listdir(cache):
+        if name not in want:
+            try:
+                os.unlink(os.path.join(cache, name))
+            except OSError:
+                pass
+    todo = []
+    for name, path in want.items():
+        dst = os.path.join(cache, name)
+        if os.path.exists(dst):
+            print(dst, flush=True)
+        else:
+            todo.append((path, dst))
+    with ThreadPoolExecutor(4) as pool:
+        for dst in pool.map(lambda t: make(*t), todo):
+            if dst:
+                print(dst, flush=True)
+
+
+if __name__ == "__main__":
+    assert key(type("E", (), {"name": "a.jpg", "stat": lambda s: os.stat_result((0,) * 8 + (12.7, 0))})()) == "a.jpg@12.jpg"
+    assert clock(0) == "0:00" and clock(75.9) == "1:15"
+    main(sys.argv[1], sys.argv[2])

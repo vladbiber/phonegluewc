@@ -1,0 +1,1 @@
+SUBSYSTEM=="module", KERNEL=="qcom_hv_haptics_lite", ACTION=="add", RUN+="/bin/chgrp plugdev /sys/module/qcom_hv_haptics_lite/parameters/vmax_mv", RUN+="/bin/chmod 0664 /sys/module/qcom_hv_haptics_lite/parameters/vmax_mv"

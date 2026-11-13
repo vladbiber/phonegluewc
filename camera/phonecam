@@ -1,0 +1,1828 @@
+#!/usr/bin/python3 -I
+"""phonecam: libcamera viewfinder with photo, video and pro modes; stills are raw frames developed by phonecam-develop."""
+import json, math, os, queue, shutil, subprocess, sys, threading, time
+
+# libcamera's dma-heap allocations fail above 1080p; hide the heap so it falls back to udmabuf
+if os.path.isdir("/dev/dma_heap") and not os.environ.get("PHONECAM_BWRAP"):
+    os.environ["PHONECAM_BWRAP"] = "1"
+    os.execvp("bwrap", ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/dma_heap",
+                        sys.executable, "-I", os.path.abspath(__file__)] + sys.argv[1:])
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, BIN)
+import numpy as np
+import cv2
+import phonecamlib as lib
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gst", "1.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gtk, Gst, GLib, Gio, Gdk, GdkPixbuf, Graphene
+
+Gst.init(None)
+cv2.setNumThreads(2)
+if os.environ.get("PHONECAM_DEBUG"):  # kill -USR1 prints every thread's stack
+    import faulthandler, signal
+    faulthandler.register(signal.SIGUSR1)
+
+# name, libcamera id, clockwise turn that puts the sensor image upright in portrait, mirrored preview,
+# modes: label, phonecam-raw sensor mode, frames stacked against noise, long edge of the photo (0: as is)
+CAMERAS = [
+    ("back", "/base/soc@0/cci@ac4b000/i2c-bus@0/camera@2d", 270, False,
+     [("12 MP", "bin", 6, 4080), ("24 MP", "full", 3, 5664), ("32 MP", "full", 3, 6528), ("50 MP", "full", 3, 0)]),
+    ("front", "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a", 90, True, [("4 MP", "full", 4, 2304)]),
+]
+VIDEO_MAX = {"back": 2560, "front": 1920}  # widest video the sensor's fast mode fills
+FPS_MAX = {"back": 30, "front": 24}  # what that mode delivers
+HANDHELD_US = 66000  # longer frames blur in hand; the rest of the exposure goes into gain
+DARK_GAIN = 8  # above this the frame count doubles: more frames instead of a longer, shakier exposure
+ZOOMS = (1, 2, 4)
+TESTSRC = bool(os.environ.get("PHONECAM_TESTSRC"))  # UI tests without the room
+LENS = "/sys/module/camu_lens/parameters/pos"
+# Lens DAC codes. Unpowered, the lens rests far inside infinity and everything is blurred. This module's
+# OTP (EEPROM 0x92) puts infinity at 395 and its close-up mark at 553; the sweep covers that with room
+# for sag when the phone points up or down and for closer subjects. shortcut: one phone's OTP,
+# read the EEPROM per unit if other phones focus short of infinity.
+LENS_LO, LENS_HI = 260, 860
+LENS_REST = 410  # just this side of infinity: sharp from about a metre out, used until autofocus has a result
+LED = "/sys/class/leds/white:flash/brightness"
+# width, height, kbit/s. x264 ultrafast is the one preset that holds 30 fps next to the viewfinder
+# (measured on noisy frames: 1440p drops under 1%, superfast at 1080p 2.4%, 4K reaches 15 fps)
+VIDEO = {"720P": (1280, 720, 10000), "1080P": (1920, 1080, 20000), "1440P": (2560, 1440, 28000)}
+# video looks are the ISP's own contrast and saturation, so they are in the recording
+LOOKS = {"STANDARD": (1.0, 1.0), "FLAT": (0.7, 0.8), "VIVID": (1.1, 1.3), "MONO": (1.05, 0.0)}
+VIEW_MAX_US = 98000  # longest exposure the viewfinder takes
+IDLE_S = 180  # an untouched viewfinder lets go of the sensor
+RED = (0.843, 0.098, 0.129)
+
+
+def affine(*ops):
+    """compose 3x4 colour ops (applied left to right) into one 3x4, rows are output R, G, B"""
+    m = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0]]
+    for o in ops:
+        m = [[sum(o[i][k] * m[k][j] for k in range(3)) + (o[i][3] if j == 3 else 0) for j in range(4)] for i in range(3)]
+    return m
+
+
+def sat(s):  # CSS saturate()
+    return [[.213 + .787 * s, .715 - .715 * s, .072 - .072 * s, 0], [.213 - .213 * s, .715 + .285 * s, .072 - .072 * s, 0],
+            [.213 - .213 * s, .715 - .715 * s, .072 + .928 * s, 0]]
+
+
+def con(c):
+    return [[c, 0, 0, (1 - c) / 2], [0, c, 0, (1 - c) / 2], [0, 0, c, (1 - c) / 2]]
+
+
+def diag(r, g, b):
+    return [[r, 0, 0, 0], [0, g, 0, 0], [0, 0, b, 0]]
+
+
+def sepia(a):  # CSS sepia()
+    sp = [[.393, .769, .189], [.349, .686, .168], [.272, .534, .131]]
+    return [[(1 - a) * (i == j) + a * sp[i][j] for j in range(3)] + [0] for i in range(3)]
+
+
+# the same matrix tints the viewfinder and the developed photo
+FILTERS = [("Natural", None), ("Vivid", affine(sat(1.3), con(1.08))), ("Warm", affine(diag(1.06, 1, .88), sat(1.05))),
+           ("Cool", affine(diag(.92, 1, 1.07))), ("B&W", affine(sat(0), con(1.15))),
+           ("Film", affine(con(.88), sat(.8), sepia(.15), diag(1.02, 1, .95)))]
+PICS = os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
+                    or os.path.expanduser("~/Pictures"), "Camera")
+VIDS = PICS  # one camera roll: the gallery shows a single folder
+CONF = os.path.join(GLib.get_user_config_dir(), "phonecam.json")
+DEFAULTS = dict(mode="photo", size=0, aspect="4:3", stack=True, dng=False, timer=0, filter=0, flash="OFF",
+                grid=False, level=False, hist=True, zebra=0, peaking=False, falsecolor=False,
+                vres="1080P", fps=30, look="STANDARD", lock=False, vguide="OFF",
+                shutter=None, angle=None, iso=None, ev=0.0, wb=None, tint=0, focus=None)
+ONOFF = [("OFF", False), ("ON", True)]
+# settings sheet: key, title, hint, options, modes that show it
+ROWS = [
+    ("size", "RESOLUTION", "", [(m[0], i) for i, m in enumerate(CAMERAS[0][4])], "photo pro"),
+    ("aspect", "ASPECT", "1.43 and 1.90 are the IMAX frames", [(n, n) for n, _ in lib.ASPECTS], "photo pro"),
+    ("stack", "MULTI-FRAME", "On: hold still, several frames merge against noise. Off: one instant frame", ONOFF, "photo pro"),
+    ("dng", "RAW", "Keeps a DNG next to the JPEG", [("OFF", False), ("DNG", True)], "photo pro"),
+    ("timer", "TIMER", "", [("OFF", 0), ("3 S", 3), ("10 S", 10)], "photo pro"),
+    ("filter", "FILTER", "", [(n.upper(), i) for i, (n, _) in enumerate(FILTERS)], "photo pro"),
+    ("vres", "RESOLUTION", "H.264 in MP4", [(k, k) for k in VIDEO], "video"),
+    ("look", "LOOK", "Flat keeps more room for grading", [(k, k) for k in LOOKS], "video"),
+    ("vguide", "FRAME GUIDE", "Lines only, the full frame is recorded", [("OFF", "OFF")] + [(n, n) for n, _ in lib.ASPECTS[2:]], "video"),
+    ("lock", "LOCK IN REC", "Shutter, ISO and white balance stay put while recording", ONOFF, "video"),
+    ("flash", "LIGHT", "", [("OFF", "OFF"), ("FLASH", "FLASH"), ("TORCH", "TORCH")], "photo video pro"),
+    ("grid", "GRID", "", ONOFF, "photo video pro"),
+    ("level", "LEVEL", "", ONOFF, "photo video pro"),
+    ("hist", "HISTOGRAM", "", ONOFF, "video pro"),
+    ("zebra", "ZEBRA", "Stripes on highlights at or above the level", [("OFF", 0), ("70%", 70), ("95%", 95)], "video pro"),
+    ("peaking", "FOCUS PEAKING", "Red on sharp edges", ONOFF, "video pro"),
+    ("falsecolor", "FALSE COLOUR", "Exposure map, legend under the picture", ONOFF, "video pro"),
+]
+# third-stop scales
+SHUTTERS = [1e6 / d for d in (8000, 6400, 5000, 4000, 3200, 2500, 2000, 1600, 1250, 1000, 800, 640, 500, 400, 320, 250,
+                              200, 160, 125, 100, 80, 60, 50, 40, 30, 25, 20, 15, 13, 10, 8, 6, 5, 4, 3, 2.5, 2)]
+GAINS = [2 ** (i / 3) for i in range(19)]
+ISOS = (100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400)
+ANGLES = [11.25, 22.5, 45, 90, 144, 172.8, 180, 270, 360]
+# false colour, ARRI scale on the display signal: upper bound in percent, RGB (None: grey image)
+FALSE = [(2.5, (128, 0, 160)), (4, (0, 60, 255)), (38, None), (42, (0, 200, 60)), (52, None), (56, (255, 130, 170)),
+         (97, None), (99, (255, 230, 0)), (101, (255, 0, 0))]
+
+FONT = {c: [int(v, 16) for v in rows.split()] for c, rows in {
+    "0": "0E 11 13 15 19 11 0E", "1": "04 0C 04 04 04 04 0E", "2": "0E 11 01 02 04 08 1F", "3": "1F 02 04 02 01 11 0E",
+    "4": "02 06 0A 12 1F 02 02", "5": "1F 10 1E 01 01 11 0E", "6": "06 08 10 1E 11 11 0E", "7": "1F 01 02 04 08 08 08",
+    "8": "0E 11 11 0E 11 11 0E", "9": "0E 11 11 0F 01 02 0C", "A": "0E 11 11 1F 11 11 11", "B": "1E 11 11 1E 11 11 1E",
+    "C": "0E 11 10 10 10 11 0E", "D": "1C 12 11 11 11 12 1C", "E": "1F 10 10 1E 10 10 1F", "F": "1F 10 10 1E 10 10 10",
+    "G": "0E 11 10 17 11 11 0F", "H": "11 11 11 1F 11 11 11", "I": "0E 04 04 04 04 04 0E", "J": "07 02 02 02 02 12 0C",
+    "K": "11 12 14 18 14 12 11", "L": "10 10 10 10 10 10 1F", "M": "11 1B 15 15 11 11 11", "N": "11 11 19 15 13 11 11",
+    "O": "0E 11 11 11 11 11 0E", "P": "1E 11 11 1E 10 10 10", "Q": "0E 11 11 11 15 12 0D", "R": "1E 11 11 1E 14 12 11",
+    "S": "0F 10 10 0E 01 01 1E", "T": "1F 04 04 04 04 04 04", "U": "11 11 11 11 11 11 0E", "V": "11 11 11 11 11 0A 04",
+    "W": "11 11 11 15 15 15 0A", "X": "11 11 0A 04 0A 11 11", "Y": "11 11 11 0A 04 04 04", "Z": "1F 01 02 04 08 10 1F",
+    ".": "00 00 00 00 00 0C 0C", ":": "00 0C 0C 00 0C 0C 00", "/": "00 01 02 04 08 10 00", "+": "00 04 04 1F 04 04 00",
+    "-": "00 00 00 1F 00 00 00", "|": "00 00 00 04 00 00 00", "%": "18 19 02 04 08 13 03", " ": "00 00 00 00 00 00 00",
+}.items()}
+
+CSS = b"""
+window { background: black; color: white; font-family: "Noto Sans", "Adwaita Sans", sans-serif; }
+button { background: none; border: none; box-shadow: none; outline: none; color: white; min-height: 0; min-width: 0; padding: 0; }
+.panel { background: black; padding: 4px 0 18px 0; }
+.shutter { transition: transform 120ms ease-out; }
+.shutter.snap { transform: scale(.86); transition: none; }
+.shutter:disabled { opacity: .5; }
+.round { min-width: 48px; min-height: 48px; border-radius: 50%; background: #1c1c1c; }
+.round:disabled { opacity: .4; }
+.thumb { border-radius: 50%; }
+.bar { padding: 8px 30px 0 30px; }
+.flash { background: black; opacity: 0; transition: opacity 180ms ease-out; }
+.flash.on { opacity: .85; transition: none; }
+.msg { font-size: 14px; background: rgba(0,0,0,.6); padding: 10px 16px; border-radius: 16px; }
+.topbar { margin: 44px 12px 0 12px; }
+.land .topbar { margin: 12px 12px 0 44px; }
+.pill { min-height: 36px; padding: 0 14px; border-radius: 18px; background: rgba(0,0,0,.55); }
+.icon { min-width: 36px; min-height: 36px; border-radius: 50%; background: rgba(0,0,0,.55); }
+.icon.on { background: white; }
+.chip { min-width: 38px; min-height: 30px; border-radius: 15px; font-size: 12px; font-weight: bold; color: #9a9a9a; }
+.chip.on { background: #1c1c1c; color: white; }
+.mode { padding: 8px 14px 4px 14px; }
+.tile { padding: 6px 0; border-radius: 12px; }
+.tile.on { background: #1c1c1c; }
+.tname { font-size: 9px; font-weight: bold; letter-spacing: 1px; color: #8a8a8a; }
+.tval { font-family: "Adwaita Mono", monospace; font-size: 13px; font-weight: bold; }
+.tile.auto .tval { color: #9a9a9a; }
+.adjust { background: rgba(0,0,0,.6); padding: 6px 0 2px 0; }
+.autob { min-width: 54px; min-height: 30px; margin: 0 6px 0 12px; border-radius: 15px; background: #1c1c1c;
+         font-size: 11px; font-weight: bold; letter-spacing: 1px; color: #9a9a9a; }
+.autob.on { background: white; color: black; }
+.sheet { background: #111111; border-radius: 28px 28px 0 0; padding: 14px 16px 24px 16px; }
+.land .sheet { border-radius: 28px 0 0 28px; }
+.rtitle { font-size: 10px; font-weight: bold; letter-spacing: 1.5px; color: #8a8a8a; }
+.rhint { font-size: 11px; color: #6a6a6a; }
+.seg { min-height: 34px; background: #1c1c1c; font-size: 11px; font-weight: bold; color: #9a9a9a; border-radius: 0; }
+.seg:first-child { border-radius: 17px 0 0 17px; }
+.seg:last-child { border-radius: 0 17px 17px 0; }
+.seg:only-child { border-radius: 17px; }
+.seg.on { background: white; color: black; }
+.close { min-height: 40px; border-radius: 20px; background: #1c1c1c; font-size: 11px; font-weight: bold; letter-spacing: 1.5px; }
+"""
+
+
+def dots(cr, text, x, y, pitch, rgb=(1, 1, 1), alpha=1.0):
+    """5x7 dot-matrix text with its top left at x, y; returns the width drawn"""
+    cr.set_source_rgba(*rgb, alpha)
+    for n, ch in enumerate(text.upper()):
+        for r, bits in enumerate(FONT.get(ch, FONT[" "])):
+            for c in range(5):
+                if bits >> (4 - c) & 1:
+                    cr.new_sub_path()
+                    cr.arc(x + (n * 6 + c + .5) * pitch, y + (r + .5) * pitch, pitch * .42, 0, 6.2832)
+    cr.fill()
+    return len(text) * 6 * pitch
+
+
+def button(name_="", **kw):
+    b = Gtk.Button(**kw)
+    b.update_property([Gtk.AccessibleProperty.LABEL], [name_])
+    return b
+
+
+class DotText(Gtk.DrawingArea):
+    def __init__(self, text="", pitch=2.0, rgb=(1, 1, 1), **kw):
+        super().__init__(content_height=math.ceil(7 * pitch), valign=Gtk.Align.CENTER, **kw)
+        self.pitch, self.rgb, self.text = pitch, rgb, None
+        self.set_draw_func(lambda _a, cr, w, h: dots(cr, self.text, 0, 0, self.pitch, self.rgb))
+        self.set(text)
+
+    def set(self, text, rgb=None):
+        if (text, rgb or self.rgb) != (self.text, self.rgb):
+            self.text, self.rgb = text, rgb or self.rgb
+            self.set_content_width(math.ceil(len(text) * 6 * self.pitch))
+            self.queue_draw()
+
+
+class Ruler(Gtk.DrawingArea):
+    """a dotted scale dragged under a fixed marker; items are (label, value), every major-th gets its label"""
+
+    def __init__(self, changed, done):
+        super().__init__(hexpand=True, content_height=52)
+        self.items, self.i, self.pos, self.major, self.step, self.changed, self.done = [], 0, 0.0, 3, 13, changed, done
+        self.set_draw_func(self.draw)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", lambda *_: setattr(self, "p0", self.pos))
+        drag.connect("drag-update", self.dragged)
+        drag.connect("drag-end", lambda *_: (setattr(self, "pos", float(self.i)), self.queue_draw(), self.done()))
+        self.add_controller(drag)
+        wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+        wheel.connect("scroll", lambda _c, dx, dy: self.step_by(1 if dx + dy > 0 else -1) or True)
+        self.add_controller(wheel)
+
+    def step_by(self, n):
+        i = min(max(self.i + n, 0), len(self.items) - 1)
+        if i != self.i:
+            self.i, self.pos = i, float(i)
+            self.changed(self.items[i][1])
+            self.queue_draw()
+            self.done()
+
+    def load(self, items, value, major):
+        self.items, self.major, self.step = items, major, 13 if len(items) > 12 else 36
+        self.i = min(range(len(items)), key=lambda j: abs(items[j][1] - value)) if value is not None else len(items) // 2
+        self.pos = float(self.i)
+        self.queue_draw()
+
+    def dragged(self, _g, dx, _dy):
+        self.pos = min(max(self.p0 - dx / self.step, 0), len(self.items) - 1)
+        if round(self.pos) != self.i:
+            self.i = round(self.pos)
+            self.changed(self.items[self.i][1])
+        self.queue_draw()
+
+    def draw(self, _a, cr, w, h):
+        cx = w / 2
+        cr.select_font_face("Adwaita Mono")
+        cr.set_font_size(10)
+        for j, (label, _v) in enumerate(self.items):
+            x = cx + (j - self.pos) * self.step
+            if not -20 < x < w + 20:
+                continue
+            near = max(0.25, 1 - abs(x - cx) / (w / 2))
+            cr.set_source_rgba(1, 1, 1, near)
+            if j % self.major == 0:
+                cr.rectangle(x - 1, 8, 2, 14)
+                cr.fill()
+                ext = cr.text_extents(label)
+                cr.move_to(x - ext.width / 2, 40)
+                cr.show_text(label)
+            else:
+                cr.arc(x, 15, 1.5, 0, 6.2832)
+                cr.fill()
+        cr.set_source_rgb(*RED)
+        cr.rectangle(cx - 1.5, 2, 3, 24)
+        cr.fill()
+
+
+class Finder(Gtk.Widget):
+    """the viewfinder: the camera picture turned upright, zoomed about the centre, tinted by a filter;
+    exposure overlays in sensor space; frame lines, grid, level, focus ring and countdown on top"""
+
+    def __init__(self):
+        super().__init__(hexpand=True, vexpand=True)
+        self.paintable, self.hid, self.zoom, self.matrix = None, None, 1.0, None
+        self.rot, self.mirror, self.overlay = 270, False, None
+        self.ring, self.ring_ok, self.aspect, self.grid, self.level = None, True, 0.0, False, None
+        self.count, self.legend, self.inset = 0, False, 0
+
+    def set_paintable(self, p):
+        if self.hid:
+            self.paintable.disconnect(self.hid)
+        self.paintable, self.hid = p, p and p.connect("invalidate-contents", lambda *_: self.queue_draw())
+        self.queue_draw()
+
+    def rect(self):
+        w, h = max(self.get_width(), 1), max(self.get_height(), 1)
+        a = self.paintable.get_intrinsic_aspect_ratio() if self.paintable else 0
+        a = a or 4 / 3
+        if self.rot in (90, 270):
+            a = 1 / a
+        dw, dh = (w, w / a) if w / h < a else (h * a, h)
+        # under the top bar when there is room for that
+        return (w - dw) / 2, max((h - dh) / 2, min(self.inset, h - dh)), dw, dh
+
+    def frame(self):
+        """the part of the picture a photo keeps: rect() cut to the aspect"""
+        x, y, dw, dh = self.rect()
+        if not self.aspect:
+            return x, y, dw, dh
+        cw, ch = lib.crop_aspect(dw, dh, self.aspect)
+        return x + (dw - cw) / 2, y + (dh - ch) / 2, cw, ch
+
+    def to_sensor(self, x, y):
+        """widget point -> 0..1 in the sensor frame, or None outside the picture"""
+        fx, fy, dw, dh = self.rect()
+        u, v = (x - fx) / dw, (y - fy) / dh
+        if not (0 <= u <= 1 and 0 <= v <= 1):
+            return None
+        u, v = .5 + (u - .5) / self.zoom, .5 + (v - .5) / self.zoom
+        if self.mirror:
+            u = 1 - u
+        return {0: (u, v), 90: (v, 1 - u), 180: (1 - u, 1 - v), 270: (1 - v, u)}[self.rot]
+
+    def set_filter(self, m):
+        # GSK multiplies the colour as a row vector: the 4x4 is our 3x4 transposed, offsets apart
+        self.matrix = m and (Graphene.Matrix().init_from_float(
+            [m[j][i] if i < 3 and j < 3 else float(i == j == 3) for i in range(4) for j in range(4)]),
+            Graphene.Vec4().init(m[0][3], m[1][3], m[2][3], 0))
+        self.queue_draw()
+
+    def do_snapshot(self, sn):
+        w, h = self.get_width(), self.get_height()
+        x, y, dw, dh = self.rect()
+        if self.paintable:
+            pw, ph = (dh, dw) if self.rot in (90, 270) else (dw, dh)
+            sn.push_clip(Graphene.Rect().init(x, y, dw, dh))
+            sn.save()
+            sn.translate(Graphene.Point().init(x + dw / 2, y + dh / 2))
+            sn.scale(-self.zoom if self.mirror else self.zoom, self.zoom)
+            sn.rotate(self.rot)
+            sn.translate(Graphene.Point().init(-pw / 2, -ph / 2))
+            if self.matrix:
+                sn.push_color_matrix(*self.matrix)
+            self.paintable.snapshot(sn, pw, ph)
+            if self.matrix:
+                sn.pop()
+            if self.overlay:
+                sn.append_texture(self.overlay, Graphene.Rect().init(0, 0, pw, ph))
+            sn.restore()
+            sn.pop()
+        cr = sn.append_cairo(Graphene.Rect().init(0, 0, w, h))
+        fx, fy, fw, fh = self.frame()
+        if self.aspect:  # what the photo drops goes dark, the kept frame gets corner marks
+            cr.set_source_rgba(0, 0, 0, .62)
+            cr.rectangle(x, y, dw, dh)
+            cr.rectangle(fx, fy, fw, fh)
+            cr.set_fill_rule(1)  # even-odd: the second rectangle is a hole
+            cr.fill()
+            cr.set_fill_rule(0)
+            cr.set_source_rgba(1, 1, 1, .9)
+            cr.set_line_width(1.5)
+            for sx, sy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                px, py, d = fx + sx * fw, fy + sy * fh, 14
+                cr.move_to(px + (d if not sx else -d), py)
+                cr.line_to(px, py)
+                cr.line_to(px, py + (d if not sy else -d))
+                cr.stroke()
+        if self.grid:
+            cr.set_source_rgba(1, 1, 1, .35)
+            cr.set_line_width(1)
+            for k in (1, 2):
+                cr.move_to(fx + fw * k / 3, fy)
+                cr.line_to(fx + fw * k / 3, fy + fh)
+                cr.move_to(fx, fy + fh * k / 3)
+                cr.line_to(fx + fw, fy + fh * k / 3)
+            cr.stroke()
+        if self.level is not None:  # the bar follows the horizon between two fixed marks
+            cx, cy, flat = x + dw / 2, y + dh / 2, abs(self.level) < 1
+            cr.set_line_width(2)
+            cr.set_source_rgba(1, 1, 1, .9 if flat else .45)
+            for s in (-1, 1):
+                cr.move_to(cx + s * 70, cy)
+                cr.line_to(cx + s * 52, cy)
+            cr.stroke()
+            a = 0 if flat else math.radians(self.level)
+            cr.set_source_rgba(*(1, 1, 1) if flat else RED, 1)
+            cr.move_to(cx - 46 * math.cos(a), cy - 46 * math.sin(a))
+            cr.line_to(cx + 46 * math.cos(a), cy + 46 * math.sin(a))
+            cr.stroke()
+        if self.ring:
+            cr.set_source_rgba(1, 1, 1, .95)
+            cr.set_line_width(2.5 if self.ring_ok else 1.2)
+            cr.arc(self.ring[0], self.ring[1], 34, 0, 6.2832)
+            cr.stroke()
+            if self.ring_ok:
+                cr.arc(self.ring[0], self.ring[1], 3, 0, 6.2832)
+                cr.fill()
+        if self.legend:
+            names = ("CLIP", "", "", "18%", "", "SKIN", "", "", "CLIP")
+            seg = dw / len(FALSE)
+            for n, (_top, rgb) in enumerate(FALSE):
+                cr.set_source_rgb(*((c / 255 for c in rgb) if rgb else (.25 + n * .06,) * 3))
+                cr.rectangle(x + n * seg, y + dh - 16, seg, 16)
+                cr.fill()
+                dots(cr, names[n], x + n * seg + 4, y + dh - 13, 1.4, (0, 0, 0) if rgb and n > 2 else (1, 1, 1))
+        if self.count:
+            p = 9
+            dots(cr, str(self.count), x + dw / 2 - len(str(self.count)) * 3 * p + p / 2, y + dh / 2 - 3.5 * p, p)
+
+
+class Cam(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Camera")
+        self.S = dict(DEFAULTS)
+        try:
+            with open(CONF) as f:
+                self.S.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+            for key, _t, _h, options, _m in ROWS + [("mode", "", "", [(m, m) for m in ("photo", "video", "pro")], "")]:
+                if self.S[key] not in [v for _l, v in options]:  # a choice that no longer exists
+                    self.S[key] = DEFAULTS[key]
+        except (OSError, ValueError):
+            pass
+        self.idx, self.pipe, self.tap, self.src, self.last = 0, None, None, None, None
+        self.busy = False  # raw frames being grabbed
+        self.jobs = queue.Queue()  # raw files waiting to be developed, one worker
+        self.pending, self.progress, self.closing = 0, 0.0, False
+        self.meter = None  # tapped point in sensor coordinates: metering for the next shot, focus area
+        self.meter_t = self.count_id = 0
+        self.live = (16667.0, 1.0)  # exposure the sensor runs at now (us, gain)
+        self.rec = None  # recording: dict(path, t0, drops, mic)
+        self.locked = None  # exposure frozen while recording
+        self.param = None  # tile being adjusted
+        self.theta = self.ui_theta = 0  # how far the phone and the screen are turned counterclockwise, degrees
+        self.roll = None
+        self.landscape = False
+        self.touched = time.monotonic()
+        self.paused = False
+        self.ctl_left, self.ctl_todo, self.ctl_sent, self.started, self.wb_isp = 0, {}, {}, 0.0, None
+        self.has_lens = os.access(LENS, os.W_OK) and not TESTSRC
+        self.af, self.af_req, self.af_wait, self.af_ref, self.af_t = None, False, 0, None, 0.0
+        self.af_seen, self.af_good, self.af_log = [], None, []
+        self.af_coarse, self.af_calm, self.af_again = None, 0, False
+        self.lens_pos = LENS_REST
+        self.hist, self.clip, self.audio, self.rgb = None, (0, 0), None, (1.0, 1.0, 1.0)
+        self.quit = self.asleep = False
+        self.tap_lock = threading.Lock()
+        self.fresh, self.starts = None, 0
+        self.frame = None
+
+        self.finder = Finder()
+        self.finder.inset = 88
+        pinch = Gtk.GestureZoom()
+        pinch.connect("begin", lambda *_: setattr(self, "zoom0", self.finder.zoom))
+        pinch.connect("scale-changed", lambda _g, f: self.set_zoom(self.zoom0 * f))
+        self.finder.add_controller(pinch)
+        tap = Gtk.GestureClick()
+        tap.connect("released", self.on_tap)
+        self.finder.add_controller(tap)
+        self.msg = Gtk.Label(css_classes=["msg"], halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, visible=False,
+                             justify=Gtk.Justification.CENTER, wrap=True, can_target=False)
+        self.flash = Gtk.Box(css_classes=["flash"], can_target=False)
+
+        # top: settings, status, light
+        self.status = DotText(pitch=1.7)
+        pill = button(child=self.status, css_classes=["pill"], name_="Settings", halign=Gtk.Align.CENTER, hexpand=True)
+        pill.connect("clicked", lambda *_: self.sheet_open(not self.sheet.get_reveal_child()))
+        self.gear = button(child=self.icon(self.draw_sliders), css_classes=["icon"], name_="Settings")
+        self.gear.connect("clicked", lambda *_: self.sheet_open(not self.sheet.get_reveal_child()))
+        self.light_icon = self.icon(self.draw_bolt)
+        self.light = button(child=self.light_icon, css_classes=["icon"], name_="Light")
+        self.light.connect("clicked", self.next_light)
+        top = Gtk.Box(spacing=8, css_classes=["topbar"], valign=Gtk.Align.START)
+        for wdg in (self.gear, pill, self.light):
+            top.append(wdg)
+        self.scope = Gtk.DrawingArea(content_width=112, content_height=58, halign=Gtk.Align.START, valign=Gtk.Align.START,
+                                     margin_start=12, margin_top=92, can_target=False)
+        self.scope.set_draw_func(self.draw_scope)
+        view = Gtk.Overlay(child=self.finder, hexpand=True, vexpand=True)
+        for wdg in (self.scope, top, self.msg):
+            view.add_overlay(wdg)
+
+        # panel: adjust ruler, value tiles, zoom, modes, shutter row
+        self.ruler = Ruler(self.adjusted, self.adjust_done)
+        self.autob = Gtk.Button(label="AUTO", css_classes=["autob"], valign=Gtk.Align.CENTER)
+        self.autob.connect("clicked", self.auto_clicked)
+        adj = Gtk.Box(css_classes=["adjust"])
+        adj.append(self.autob)
+        adj.append(self.ruler)
+        # over the foot of the picture, so opening it does not move the picture
+        self.adjust = Gtk.Revealer(child=adj, transition_type=Gtk.RevealerTransitionType.CROSSFADE, transition_duration=140,
+                                   valign=Gtk.Align.END)
+        view.add_overlay(self.adjust)
+        self.tiles_box = Gtk.Box(homogeneous=True, margin_start=8, margin_end=8)
+        self.tiles = {}
+        self.chips = []
+        self.zoom_box = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER, margin_top=4)
+        for z in ZOOMS:
+            c = button(css_classes=["chip"], label=f"{z}x", name_=f"Zoom {z}x")
+            c.connect("clicked", lambda _b, z=z: self.set_zoom(z))
+            self.zoom_box.append(c)
+            self.chips.append(c)
+        self.modes = {}
+        modes = Gtk.Box(halign=Gtk.Align.CENTER)
+        for m in ("photo", "video", "pro"):
+            d = DotText(m, pitch=1.9)
+            b = button(child=d, css_classes=["mode"], name_=m.capitalize() + " mode")
+            b.connect("clicked", lambda _b, m=m: self.set_mode(m))
+            modes.append(b)
+            self.modes[m] = (b, d)
+        self.thumb_pic = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, css_classes=["thumb"], halign=Gtk.Align.CENTER,
+                                     valign=Gtk.Align.CENTER, width_request=48, height_request=48)
+        self.ring = Gtk.DrawingArea(can_target=False)
+        self.ring.set_draw_func(self.draw_ring)
+        tover = Gtk.Overlay(child=self.thumb_pic)
+        tover.add_overlay(self.ring)
+        self.thumb = button(child=tover, css_classes=["round"], name_="Open last shot", valign=Gtk.Align.CENTER,
+                            halign=Gtk.Align.CENTER, width_request=48, height_request=48,
+                                overflow=Gtk.Overflow.HIDDEN, sensitive=False)
+        self.thumb.connect("clicked", self.open_last)
+        self.shutter_art = self.icon(self.draw_shutter, 76)
+        self.shutter = button(child=self.shutter_art, css_classes=["shutter"], name_="Shutter", valign=Gtk.Align.CENTER)
+        self.shutter.connect("clicked", self.shutter_clicked)
+        self.flip = button(child=self.icon(self.draw_flip, 26), css_classes=["round"], name_="Switch camera",
+                               valign=Gtk.Align.CENTER)
+        self.flip.connect("clicked", self.switch)
+        bar = Gtk.CenterBox(css_classes=["bar"])
+        bar.set_start_widget(self.thumb)
+        bar.set_center_widget(self.shutter)
+        bar.set_end_widget(self.flip)
+        self.panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["panel"], valign=Gtk.Align.END)
+        for wdg in (self.tiles_box, self.zoom_box, modes, bar):
+            self.panel.append(wdg)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.body.append(view)
+        self.body.append(self.panel)
+
+        self.rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        close = Gtk.Button(label="DONE", css_classes=["close"], margin_top=14)
+        close.connect("clicked", lambda *_: self.sheet_open(False))
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["sheet"])
+        self.scroll = Gtk.ScrolledWindow(child=self.rows, hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                         propagate_natural_height=True, max_content_height=470, vexpand=True)
+        inner.append(self.scroll)
+        inner.append(close)
+        self.sheet = Gtk.Revealer(child=inner, transition_type=Gtk.RevealerTransitionType.SLIDE_UP, transition_duration=180,
+                                  valign=Gtk.Align.END)
+        root = Gtk.Overlay(child=self.body)
+        root.add_overlay(self.sheet)
+        root.add_overlay(self.flash)
+        self.set_child(root)
+
+        self.connect("close-request", self.on_close)
+        self.connect("notify::suspended", self.on_suspended)
+        self.connect("realize", lambda *_: self.get_surface().connect("layout", self.on_layout))
+        threading.Thread(target=self.developer, daemon=True).start()
+        threading.Thread(target=self.analyse, daemon=True).start()
+        threading.Thread(target=self.poll_sensor, daemon=True).start()
+        if shutil.which("ssccli") and not TESTSRC:
+            threading.Thread(target=self.gravity, daemon=True).start()
+        GLib.timeout_add(1000, self.tick)
+        self.set_zoom(1)
+        self.set_mode(self.S["mode"], first=True)
+        GLib.timeout_add(1500, self.script, os.environ.get("PHONECAM_DO", "").split())
+
+    def script(self, steps):
+        """PHONECAM_DO="flip 3 mode:video set:look=FLAT 4 shutter 10 shutter": the buttons' own handlers
+        run in order, numbers are seconds to wait. For checks on the phone without a finger."""
+        if not steps:
+            return False
+        step, wait = steps.pop(0), 200
+        name, _, arg = step.partition(":")
+        key, _, val = arg.partition("=")
+        if step.replace(".", "").isdigit():
+            wait = int(float(step) * 1000)
+        elif name == "set":
+            self.set_option(key, {str(v).lower(): v for r in ROWS if r[0] == key for _l, v in r[3]}[val.lower()])
+        elif name == "param":  # param:iso=4 sets a tile's value, param:iso returns it to automatic
+            self.select(key)
+            if val:
+                self.adjusted(float(val) if "." in val else int(val))
+            elif self.S[key] is not None:
+                self.auto_clicked()
+            self.adjust_done()
+        else:
+            {"flip": self.switch, "shutter": self.shutter_clicked, "mode": lambda: self.set_mode(arg),
+             "sheet": lambda: self.sheet_open(True), "tap": lambda: self.on_tap(None, 1, *map(float, arg.split(","))),
+             "zoom": lambda: self.set_zoom(float(arg)), "quit": self.close,
+             "dump": lambda: print("DUMP", self.S["mode"], self.cam[0], self.finder.paintable, self.fresh,
+                                   self.pipe and self.pipe.get_state(0), self.finder.rect(), self.finder.rot,
+                                   self.frame and self.frame[1:], file=sys.stderr, flush=True)}[name]()
+        GLib.timeout_add(wait, self.script, steps)
+        return False
+
+    # ---- small drawings: the icon theme here has none of these
+
+    @staticmethod
+    def icon(draw, size=20):
+        d = Gtk.DrawingArea(content_width=size, content_height=size, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        d.set_draw_func(draw)
+        return d
+
+    @staticmethod
+    def draw_flip(_a, cr, w, h):
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_line_width(2.2)
+        cx, cy, r = w / 2, h / 2, 9
+        for a0, a1, tip in ((3.5, 6.0, 6.0), (0.36, 2.85, 2.85)):
+            cr.new_path()
+            cr.arc(cx, cy, r, a0, a1)
+            cr.stroke()
+            x, y = cx + r * math.cos(tip), cy + r * math.sin(tip)
+            cr.move_to(x - 4, y - 3 if tip > 3 else y + 3)
+            cr.line_to(x, y)
+            cr.line_to(x + 4, y - 3 if tip > 3 else y + 3)
+            cr.stroke()
+
+    @staticmethod
+    def draw_sliders(_a, cr, w, h):
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_line_width(1.8)
+        for y, kx in ((5, 13), (10, 6), (15, 11)):
+            cr.move_to(2, y)
+            cr.line_to(18, y)
+            cr.stroke()
+            cr.arc(kx, y, 2.6, 0, 6.2832)
+            cr.fill()
+
+    def draw_shutter(self, _a, cr, w, h):
+        """white ring; inside it a white disc for photos, a red one for video, a red square while recording"""
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_line_width(3)
+        cr.arc(w / 2, h / 2, w / 2 - 2, 0, 6.2832)
+        cr.stroke()
+        if self.S["mode"] == "video":
+            cr.set_source_rgb(*RED)
+        if self.rec:
+            r, k = 13, 5
+            x, y = w / 2 - r, h / 2 - r
+            for i, (cx, cy) in enumerate(((x + 2 * r - k, y + k), (x + 2 * r - k, y + 2 * r - k), (x + k, y + 2 * r - k), (x + k, y + k))):
+                cr.arc(cx, cy, k, (i - 1) * math.pi / 2, i * math.pi / 2)
+            cr.close_path()
+        else:
+            cr.arc(w / 2, h / 2, w / 2 - 8, 0, 6.2832)
+        cr.fill()
+
+    def draw_bolt(self, _a, cr, w, h):
+        on = self.S["flash"] != "OFF"
+        cr.set_source_rgb(*(0, 0, 0) if on else (1, 1, 1))
+        for i, (x, y) in enumerate(((11.5, 1.5), (4.5, 11), (9, 11), (8, 18.5), (15.5, 8.5), (10.5, 8.5))):
+            (cr.line_to if i else cr.move_to)(x, y)
+        cr.close_path()
+        if self.S["flash"] == "TORCH" or not on:
+            cr.fill()
+        else:
+            cr.set_line_width(1.6)
+            cr.stroke()
+
+    def draw_scope(self, _a, cr, w, h):
+        """luma histogram with clipping lights, audio level while recording"""
+        if self.hist is None:
+            return
+        cr.set_source_rgba(0, 0, 0, .55)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+        n, top = len(self.hist), max(float(self.hist[2:-2].max()), 1.0)
+        cr.set_source_rgba(1, 1, 1, .85)
+        for i, v in enumerate(self.hist):
+            bh = min(1.0, v / top) * (h - 12)
+            cr.rectangle(4 + i * (w - 8) / n, h - 4 - bh, (w - 8) / n - .5, bh)
+        cr.fill()
+        lo, hi = self.clip
+        for x, frac, rgb in ((7, lo, (.35, .55, 1)), (w - 7, hi, RED)):
+            if frac > .005:
+                cr.set_source_rgb(*rgb)
+                cr.arc(x, 6, 3, 0, 6.2832)
+                cr.fill()
+        if self.audio is not None:  # peak, -60..0 dB across the bottom edge
+            cr.set_source_rgb(*RED if self.audio > -3 else (1, 1, 1))
+            cr.rectangle(4, h - 3, (w - 8) * min(max((self.audio + 60) / 60, 0), 1), 2)
+            cr.fill()
+
+    def draw_ring(self, _a, cr, w, h):
+        """progress of the photo being developed, around the thumbnail"""
+        if not self.pending:
+            return
+        cx, cy, r = w / 2, h / 2, min(w, h) / 2 - 2.5
+        cr.set_line_width(3)
+        cr.set_source_rgba(0, 0, 0, .45)
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.stroke()
+        cr.set_source_rgb(1, 1, 1)
+        cr.arc(cx, cy, r, -math.pi / 2, -math.pi / 2 + 2 * math.pi * max(self.progress, .04))
+        cr.stroke()
+
+    def still(self):
+        """the newest frame as a texture of our own. Never the sink's current image: that one holds a
+        camera buffer, the buffer keeps libcamera's manager alive across a restart, and the camera then
+        still calls into the pipeline that was just freed (libcamerasrc never disconnects) and crashes."""
+        if not self.frame:
+            return None
+        data, w, h, fmt = self.frame
+        small = cv2.resize(np.frombuffer(data, np.uint8).reshape(h, -1, 4)[:, :w], (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+        return Gdk.MemoryTexture.new(w // 2, h // 2, Gdk.MemoryFormat.B8G8R8A8 if fmt.startswith("BGR") else
+                                     Gdk.MemoryFormat.R8G8B8A8, GLib.Bytes.new(small.tobytes()), w // 2 * 4)
+
+    def show_thumb(self, p, rot=0, mirror=False):
+        """a small square cut of a picture, turned upright; a bare picture would ask for its full size"""
+        n, a = 48, p.get_intrinsic_aspect_ratio() or 1
+        w, h = (n * a, n) if a > 1 else (n, n / a)
+        sn = Gtk.Snapshot()
+        sn.push_clip(Graphene.Rect().init(0, 0, n, n))
+        sn.translate(Graphene.Point().init(n / 2, n / 2))
+        sn.scale(-1 if mirror else 1, 1)
+        sn.rotate(rot)
+        sn.translate(Graphene.Point().init(-w / 2, -h / 2))
+        p.snapshot(sn, w, h)
+        sn.pop()
+        self.thumb_pic.set_paintable(sn.to_paintable(Graphene.Size().init(n, n)))
+
+    # ---- state
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(CONF), exist_ok=True)
+            with open(CONF, "w") as f:
+                json.dump(self.S, f)
+        except OSError:
+            pass
+
+    @property
+    def cam(self):
+        return CAMERAS[self.idx]
+
+    @property
+    def manual(self):
+        return self.S["mode"] != "photo"
+
+    @property
+    def fps(self):
+        return min(self.S["fps"], FPS_MAX[self.cam[0]])
+
+    def lens_ok(self):
+        return self.has_lens and self.cam[0] == "back"
+
+    def set_mode(self, mode, first=False):
+        if self.rec or self.busy:
+            return
+        was = self.S["mode"]
+        self.S["mode"] = mode
+        for m, (b, d) in self.modes.items():
+            d.set(m, (1, 1, 1) if m == mode else (.5, .5, .5))
+        self.shutter_art.queue_draw()
+        self.select(None)
+        self.build_tiles()
+        self.zoom_box.set_visible(mode != "video")
+        if mode == "video":
+            self.set_zoom(1)
+        self.refresh()
+        if first or (mode == "video") != (was == "video") or not self.pipe:
+            self.start()
+        else:
+            self.push_controls()
+        self.save()
+
+    def refresh(self):
+        """everything on screen that follows the settings"""
+        S, f = self.S, self.finder
+        photo = S["mode"] != "video"
+        name = S["aspect"] if photo else S["vguide"]
+        f.aspect = dict(lib.ASPECTS).get(name, 0.0) if name not in ("4:3", "OFF") else 0.0
+        f.grid, f.legend = S["grid"], self.manual and S["falsecolor"]
+        f.set_filter(self.view_matrix())
+        self.scope.set_visible(self.manual and S["hist"])
+        self.light_icon.queue_draw()
+        (self.light.add_css_class if S["flash"] != "OFF" else self.light.remove_css_class)("on")
+        self.set_led(S["flash"] == "TORCH" and not self.paused)
+        self.update_status()
+        for k in self.tiles:
+            self.update_tile(k)
+        f.queue_draw()
+
+    def view_matrix(self):
+        ops = []
+        if self.manual and self.S["wb"] and self.wb_isp and self.ctl_sent.get("awb-enable") == "false":
+            # white balance being dialled: shown as the ratio to what the ISP has now (display values are gamma encoded)
+            rg, bg = lib.kelvin_gains(self.S["wb"], self.S["tint"])
+            isp = [float(v) for v in self.ctl_sent["colour-gains"].strip("<>").split(",")]
+            ops.append(diag((rg / isp[0]) ** .45, 1, (bg / isp[1]) ** .45))
+        if self.S["mode"] == "pro" and self.S["ev"]:
+            ops.append(diag(*(2 ** self.S["ev"],) * 3))
+        if self.S["mode"] != "video" and FILTERS[self.S["filter"]][1]:
+            ops.append(FILTERS[self.S["filter"]][1])
+        return affine(*ops) if ops else None
+
+    def update_status(self):
+        S = self.S
+        if self.rec:
+            t = int(time.monotonic() - self.rec["t0"])
+            left = shutil.disk_usage(VIDS).free * 8 / (VIDEO[S["vres"]][2] * 1000) / 60
+            text = f"REC {t // 60:02d}:{t % 60:02d} | {left:.0f} MIN" + (" | NO MIC" if not self.rec["mic"] else "") \
+                + (f" | DROP {self.rec['drops']}" if self.rec["drops"] else "")
+            return self.status.set(text, RED)
+        if S["mode"] == "video":
+            text = f"{S['vres']} | {self.fps} FPS | {S['look']}"
+        else:
+            modes = self.cam[4]
+            text = f"{modes[min(S['size'], len(modes) - 1)][0]} | {S['aspect']}" + (" | STACK" if S["stack"] else "") \
+                + (" | RAW" if S["dng"] else "") + (f" | {S['timer']}S" if S["timer"] else "")
+        self.status.set(text, (1, 1, 1))
+
+    # ---- value tiles and the ruler
+
+    def params(self):
+        if self.S["mode"] == "photo":
+            return []
+        p = ["fps", "angle"] if self.S["mode"] == "video" else ["shutter"]
+        p += ["iso"] + (["ev"] if self.S["mode"] == "pro" else []) + ["wb", "tint"]
+        return p + (["focus"] if self.lens_ok() else [])
+
+    def build_tiles(self):
+        while (c := self.tiles_box.get_first_child()):
+            self.tiles_box.remove(c)
+        self.tiles = {}
+        for k in self.params():
+            name = Gtk.Label(label={"wb": "WB", "iso": "ISO", "ev": "EV", "fps": "FPS"}.get(k, k.upper()), css_classes=["tname"])
+            val = Gtk.Label(css_classes=["tval"])
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            box.append(name)
+            box.append(val)
+            b = Gtk.Button(child=box, css_classes=["tile"])
+            b.connect("clicked", lambda _b, k=k: self.select(None if self.param == k else k))
+            self.tiles_box.append(b)
+            self.tiles[k] = (b, val)
+        self.tiles_box.set_visible(bool(self.tiles))
+
+    def tile_text(self, k):
+        """(text, is automatic)"""
+        S, (exp, gain) = self.S, self.live
+        if k == "shutter":
+            return lib.shutter_label(S[k] or exp), not S[k]
+        if k == "angle":
+            return f"{S[k] or min(360, exp * self.fps * 360 / 1e6):.4g}°", not S[k]
+        if k == "iso":
+            return str(min(ISOS, key=lambda i: abs(math.log(i / 100 / (S[k] or gain))))), not S[k]
+        if k == "ev":
+            return f"{S[k]:+.1f}", False
+        if k == "wb":
+            return (f"{S[k]}K", False) if S[k] else ("AWB", True)
+        if k == "tint":
+            return (f"{S[k]:+d}", False) if S["wb"] else ("-", True)
+        if k == "focus":
+            return ("AF", True) if S[k] is None else (f"MF {S[k]}", False)
+        return str(self.fps if k == "fps" else S[k]), False
+
+    def update_tile(self, k):
+        b, val = self.tiles[k]
+        text, auto = self.tile_text(k)
+        val.set_label(text)
+        (b.add_css_class if auto else b.remove_css_class)("auto")
+        (b.add_css_class if k == self.param else b.remove_css_class)("on")
+        if k == self.param:
+            has_auto = k in ("shutter", "angle", "iso", "wb", "focus")
+            self.autob.set_label({"focus": "AF"}.get(k, "AUTO") if has_auto else "RESET")
+            (self.autob.add_css_class if auto and has_auto else self.autob.remove_css_class)("on")
+
+    def select(self, k):
+        self.param = k
+        if k:
+            S = self.S
+            items, major = {
+                "shutter": ([(lib.shutter_label(u), u) for u in SHUTTERS], 3),
+                "angle": ([(f"{a:g}", a) for a in ANGLES], 1),
+                "iso": (list(zip(map(str, ISOS), GAINS)), 3),
+                "ev": ([(f"{i / 3:+.0f}", i / 3) for i in range(-9, 10)], 3),
+                "wb": ([(f"{k_}", k_) for k_ in range(2000, 10001, 100)], 10),
+                "tint": ([(f"{t:+d}", t) for t in range(-50, 51, 5)], 2),
+                "focus": ([(f"{i}", i) for i in range(0, 101)], 10),
+                "fps": ([(str(f), f) for f in (24, 25, 30) if f <= FPS_MAX[self.cam[0]]], 1),
+            }[k]
+            cur = S[k]
+            if cur is None:  # the scale starts where the automatic value is now
+                cur = {"shutter": self.live[0], "angle": 180, "iso": self.live[1], "wb": 5000,
+                       "focus": round((self.lens_pos - LENS_LO) * 100 / (LENS_HI - LENS_LO))}[k]
+            self.ruler.load(items, cur, major)
+        self.adjust.set_reveal_child(bool(k))
+        for t in self.tiles:
+            self.update_tile(t)
+
+    def adjusted(self, value):
+        k, S = self.param, self.S
+        self.touched = time.monotonic()
+        S[k] = value
+        if k == "tint" and not S["wb"]:
+            S["wb"] = 5000
+        if k == "focus":
+            self.af = None
+            self.set_lens(LENS_LO + value * (LENS_HI - LENS_LO) // 100)
+        if k == "fps":
+            self.set_fps()
+        self.after_param(k)
+
+    def adjust_done(self):
+        if self.param in ("wb", "tint"):
+            self.push_controls()
+
+    def auto_clicked(self, *_):
+        k, S = self.param, self.S
+        if k in ("ev", "tint"):
+            S[k] = 0
+        elif k == "fps":
+            S[k] = 30
+            self.set_fps()
+        elif S[k] is None:  # automatic to manual, from the value in use now
+            self.adjusted(self.ruler.items[self.ruler.i][1])
+            return
+        else:
+            S[k] = None
+            if k == "focus":
+                self.af_req = True
+        self.select(k)
+        self.after_param(k)
+        self.adjust_done()
+
+    def after_param(self, k):
+        for t in self.tiles:
+            self.update_tile(t)
+        if k in ("ev", "wb", "tint"):
+            self.finder.set_filter(self.view_matrix())
+        elif k != "focus":
+            self.push_controls()
+        self.update_status()
+        self.save()
+
+    # ---- settings sheet
+
+    def sheet_open(self, show):
+        if show and (self.rec or self.busy):
+            return
+        if show:
+            while (c := self.rows.get_first_child()):
+                self.rows.remove(c)
+            for key, title, hint, options, modes in ROWS:
+                if key == "vres":
+                    options = [o for o in options if VIDEO[o[1]][0] <= VIDEO_MAX[self.cam[0]]]
+                if self.S["mode"] not in modes.split() or (key == "size" and len(self.cam[4]) < 2) \
+                        or (key == "flash" and not os.access(LED, os.W_OK) and not TESTSRC):
+                    continue
+                row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+                row.append(Gtk.Label(label=title, css_classes=["rtitle"], xalign=0))
+                seg = Gtk.Box(homogeneous=True)
+                for label, value in options:
+                    b = Gtk.Button(label=label, css_classes=["seg", "on"] if self.S[key] == value else ["seg"], hexpand=True)
+                    b.connect("clicked", self.option, key, value, seg)
+                    seg.append(b)
+                row.append(seg)
+                if hint:
+                    row.append(Gtk.Label(label=hint, css_classes=["rhint"], xalign=0, wrap=True))
+                self.rows.append(row)
+        self.sheet.set_reveal_child(show)
+
+    def option(self, button, key, value, seg):
+        c = seg.get_first_child()
+        while c:
+            (c.add_css_class if c is button else c.remove_css_class)("on")
+            c = c.get_next_sibling()
+        self.set_option(key, value)
+
+    def set_option(self, key, value):
+        self.S[key] = value
+        if key == "vres":
+            self.start()
+        elif key == "look":
+            self.push_controls()
+        self.refresh()
+        self.save()
+
+    def next_light(self, *_):
+        order = ["OFF", "FLASH", "TORCH"]
+        self.S["flash"] = order[(order.index(self.S["flash"]) + 1) % 3]
+        self.refresh()
+        self.save()
+
+    def set_led(self, on):
+        try:
+            with open(LED, "w") as f:
+                f.write("120" if on else "0")
+        except OSError:
+            pass
+
+    # ---- pipeline
+
+    def controls(self):
+        """libcamera controls for the mode and manual values, as libcamerasrc properties"""
+        S = self.S
+        us = gain = wb = None
+        look = LOOKS["STANDARD"]
+        if S["mode"] == "pro":
+            us, gain = S["shutter"], S["iso"]
+        elif S["mode"] == "video":
+            us, gain, look = S["angle"] and lib.shutter_us(S["angle"], self.fps), S["iso"], LOOKS[S["look"]]
+            if self.locked:
+                us, gain, wb = us or self.locked[0], gain or self.locked[1], self.locked[2]
+        if self.manual and S["wb"]:
+            wb = lib.kelvin_gains(S["wb"], S["tint"])
+        self.wb_isp = wb and tuple(min(max(g, 1.0), 3.99) for g in wb)
+        # every key every time, values that are ignored while their mode is automatic included:
+        # a key first set while frames flow would be added to a table libcamera's own thread is writing
+        return {"exposure-time-mode": "manual" if us else "auto", "exposure-time": str(int(min(us or 10000, VIEW_MAX_US))),
+                "analogue-gain-mode": "manual" if gain else "auto", "analogue-gain": f"{gain or 1:.3f}",
+                "awb-enable": "false" if wb else "true", "colour-gains": "<%.3f,%.3f>" % (self.wb_isp or (1.5, 1.5)),
+                "contrast": f"{look[0]:.2f}", "saturation": f"{look[1]:.2f}"}
+
+    def push_controls(self):
+        """send what changed to the running camera. libcamerasrc loses about every other change
+        (it attaches them to a request it may then drop), so each one is set four times."""
+        want = self.controls()
+        self.ctl_todo.update({k: v for k, v in want.items() if self.ctl_sent.get(k) != v})
+        self.ctl_sent = want
+        if self.ctl_todo and not self.ctl_left:
+            GLib.timeout_add(40, self.ctl_tick)
+        self.ctl_left = 4 if self.ctl_todo else 0
+        self.finder.set_filter(self.view_matrix())
+
+    def ctl_tick(self):
+        if self.src and time.monotonic() - self.started > .7:  # not while its first frames set the table up
+            for k, v in self.ctl_todo.items():
+                Gst.util_set_object_arg(self.src, k, v)
+            self.ctl_left -= 1
+        if self.ctl_left <= 0 or not self.src:
+            self.ctl_todo, self.ctl_left = {}, 0
+        return self.ctl_left > 0
+
+    def set_fps(self):
+        """the frame rate is the sensor's vertical blanking; libcamera leaves that control alone"""
+        if TESTSRC or not self.pipe or self.S["mode"] != "video":
+            return
+        threading.Thread(target=subprocess.run, args=([os.path.join(BIN, "phonecam-raw"), "--fps", self.cam[0],
+                                                       str(self.fps)],), daemon=True).start()
+
+    def stop(self):
+        if self.pipe:
+            self.pipe.get_bus().remove_signal_watch()
+            with self.tap_lock:  # no camera buffer may outlive its pipeline, see still()
+                self.tap = None
+            if self.fresh:
+                for h in self.fresh[1]:
+                    self.fresh[0].disconnect(h)
+                self.fresh = None
+            else:
+                self.finder.set_paintable(self.still())
+            self.pipe.set_state(Gst.State.NULL)
+            self.pipe = self.src = None
+
+    def start(self, record=None):
+        self.stop()
+        self.paused = False
+        name, path, _rot, _mirror, _modes = self.cam
+        video = self.S["mode"] == "video"
+        w, h, kbit = VIDEO[self.S["vres"]] if video else (2048, 1536, 0)
+        if TESTSRC:
+            src = f"videotestsrc is-live=true pattern=smpte ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1"
+        else:
+            src = f'libcamerasrc name=src camera-name="{path}" ! video/x-raw,width={w},height={h}'
+        # the screen gets a scaled copy, never the camera's own buffer: GTK keeps the last picture it drew,
+        # and a camera buffer alive after its pipeline wrecks the next one (see still())
+        view = "width=1280,height=720" if video else "width=1440,height=1080"
+        desc = (src + " ! tee name=t t. ! queue leaky=downstream max-size-buffers=2 ! videoconvertscale n-threads=2"
+                f" ! video/x-raw,format=BGRA,{view} ! gtk4paintablesink name=sink"
+                " t. ! queue leaky=downstream max-size-buffers=1 ! appsink name=tap max-buffers=1 drop=true sync=false")
+        mic = None
+        if record:
+            mic = self.microphone()
+            # the picture is stored as the sensor sees it; players turn it by the orientation tag
+            turn = (self.cam[2] - self.theta if name == "back" else self.cam[2] + self.theta) % 360
+            desc += (f" t. ! queue name=recq leaky=downstream max-size-buffers=8 ! videoconvert n-threads=4"
+                     f" ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast bitrate={kbit} key-int-max=30 threads=6"
+                     f" ! h264parse ! taginject tags=\"image-orientation=(string)rotate-{turn}\""
+                     f" ! queue ! mux. mp4mux name=mux ! filesink location=\"{record}\"")
+            if mic:
+                desc += (f" pulsesrc device={mic} ! audioconvert ! audioresample ! level name=level interval=100000000"
+                         " ! fdkaacenc bitrate=128000 ! queue ! mux.")
+        try:
+            self.pipe = Gst.parse_launch(desc)
+        except GLib.Error as e:
+            return self.show_msg(f"Camera unavailable\n{e.message}")
+        self.src, self.tap = self.pipe.get_by_name("src"), self.pipe.get_by_name("tap")
+        self.ctl_sent, self.ctl_todo, self.ctl_left, self.started = self.controls(), {}, 0, time.monotonic()
+        if self.src:
+            for k, v in self.ctl_sent.items():
+                Gst.util_set_object_arg(self.src, k, v)
+        self.finder.set_filter(self.view_matrix())
+        if record:
+            self.pipe.get_by_name("recq").connect("overrun", self.on_drop)
+        pt = self.pipe.get_by_name("sink").props.paintable
+        # the still frame put up by stop() stays until the first new frame (a new size comes as its own signal).
+        # Nothing here may keep the paintable alive past its pipeline, see still().
+        self.fresh = (pt, [pt.connect(sig, self.first_frame) for sig in ("invalidate-contents", "invalidate-size")])
+        self.starts = n = self.starts + 1
+        GLib.timeout_add(2500, lambda: n == self.starts and self.fresh and self.first_frame(self.fresh[0]) and False)
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_error)
+        bus.connect("message::eos", lambda *_: self.recorded())
+        bus.connect("message::element", self.on_element)
+        self.show_msg("")
+        self.orient()
+        if self.pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            return self.show_msg("Camera busy or missing")
+        self.af_ref, self.af_seen = None, []
+        if self.lens_ok():
+            if self.S["focus"] is not None and self.manual:
+                self.set_lens(LENS_LO + self.S["focus"] * (LENS_HI - LENS_LO) // 100)
+            elif self.af_good is None:
+                self.set_lens(LENS_REST)
+                self.af_req = True
+            else:  # a restart after a photo keeps the focus it had
+                self.set_lens(self.af_good)
+        if video and self.fps != FPS_MAX[self.cam[0]]:
+            GLib.timeout_add(600, lambda: self.set_fps() and False)
+        return mic
+
+    def first_frame(self, pt):
+        if self.fresh and self.fresh[0] is pt:
+            for h in self.fresh[1]:
+                pt.disconnect(h)
+            self.fresh = None
+            self.finder.set_paintable(pt)
+
+    def show_msg(self, text):
+        self.msg.set_text(text)
+        self.msg.set_visible(bool(text))
+
+    def on_error(self, _bus, m):
+        err, _ = m.parse_error()
+        rec, self.rec = self.rec, None
+        self.stop()
+        self.show_msg(f"Camera error\n{err.message}")
+        if rec:
+            self.record_ui(False)
+
+    def switch(self, *_):
+        if self.rec or self.busy:
+            return
+        self.idx = (self.idx + 1) % len(CAMERAS)
+        if VIDEO[self.S["vres"]][0] > VIDEO_MAX[self.cam[0]]:
+            self.S["vres"] = "1080P"
+        self.frame = self.af_good = None  # the other camera's picture would show turned the wrong way
+        self.clear_meter()
+        self.set_zoom(1)
+        self.select(None)
+        self.build_tiles()
+        self.set_lens(-1)
+        self.refresh()
+        self.start()
+
+    def set_zoom(self, z):
+        z = min(max(z, 1.0), 8.0) if self.S["mode"] != "video" else 1.0
+        if abs(z - round(z)) < .06:
+            z = float(round(z))
+        if self.finder.zoom != z:
+            self.clear_meter()
+        self.finder.zoom = z
+        self.finder.queue_draw()
+        for c, cz in zip(self.chips, ZOOMS):
+            on = cz <= z < (ZOOMS + (99,))[ZOOMS.index(cz) + 1]
+            c.set_label((f"{z:.1f}x" if z != cz else f"{cz}x") if on else f"{cz}x")
+            (c.add_css_class if on else c.remove_css_class)("on")
+
+    def on_tap(self, _g, _n, x, y):
+        """a tap sets where to focus and what to expose the next photo for"""
+        self.touched = time.monotonic()
+        if self.sheet.get_reveal_child():
+            return self.sheet_open(False)
+        if self.paused:
+            return self.start()
+        if self.param:
+            return self.select(None)
+        p = self.finder.to_sensor(x, y)
+        if not p:
+            return
+        self.meter = p
+        self.finder.ring, self.finder.ring_ok = (x, y), not self.lens_ok() or self.S["focus"] is not None
+        if self.lens_ok() and (self.S["focus"] is None or not self.manual):
+            self.af_req = True
+        self.finder.queue_draw()
+        t = self.meter_t = time.monotonic()
+        GLib.timeout_add(10000, lambda: self.meter_t == t and self.clear_meter())
+
+    def clear_meter(self):
+        self.meter = self.finder.ring = None
+        self.finder.queue_draw()
+
+    # ---- orientation
+
+    def on_layout(self, _s, w, h):
+        land = w > h
+        if land != self.landscape:
+            self.landscape = land
+            GLib.idle_add(self.relayout)
+
+    def relayout(self):
+        land = self.landscape
+        self.body.set_orientation(Gtk.Orientation.HORIZONTAL if land else Gtk.Orientation.VERTICAL)
+        self.panel.set_size_request(330 if land else -1, -1)
+        self.sheet.set_halign(Gtk.Align.END if land else Gtk.Align.FILL)
+        self.sheet.set_size_request(340 if land else -1, -1)
+        self.scroll.set_max_content_height(250 if land else 470)
+        (self.add_css_class if land else self.remove_css_class)("land")
+        self.finder.inset = 0 if land else 88
+        self.orient()
+
+    def orient(self):
+        """turn the picture for the way the screen is turned"""
+        if self.landscape:
+            self.ui_theta = self.theta if self.theta in (90, 270) else self.ui_theta if self.ui_theta in (90, 270) else 90
+        else:
+            self.ui_theta = 0
+        name, _p, rot, mirror, _m = self.cam
+        self.finder.rot = (rot - self.ui_theta if name == "back" else rot + self.ui_theta) % 360
+        self.finder.mirror = mirror
+        self.finder.queue_draw()
+
+    def gravity(self):
+        """accelerometer: which side is up (for the saved photo) and the roll for the level"""
+        while not self.quit:
+            try:
+                p = subprocess.Popen(["ssccli", "--sensor", "accelerometer", "--timeout", "600"], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True)
+            except OSError:
+                return
+            self.ssc, last = p, 0.0
+            for line in p.stdout:
+                now = time.monotonic()
+                if self.quit:
+                    break
+                if now - last < .1 or "X=" not in line:
+                    continue
+                last = now
+                try:
+                    x, y = (float(line.split(a + "=")[1].split()[0]) for a in "XY")
+                except (IndexError, ValueError):
+                    continue
+                if math.hypot(x, y) < 3:  # lying flat: no side is up
+                    roll = None
+                else:
+                    ang = math.degrees(math.atan2(x, y)) % 360  # screen axes: x right, y up; 0 is upright portrait
+                    if min((ang - self.theta) % 360, (self.theta - ang) % 360) > 60:
+                        self.theta = round(ang / 90) % 4 * 90
+                    roll = (ang - self.theta + 180) % 360 - 180
+                GLib.idle_add(self.set_roll, roll)
+            p.kill()
+            p.wait()
+            time.sleep(1)
+
+    def set_roll(self, roll):
+        self.roll = roll
+        level = roll if self.S["level"] and roll is not None else None
+        if level != self.finder.level:
+            self.finder.level = level
+            self.finder.queue_draw()
+        if self.landscape and self.ui_theta != self.theta and self.theta in (90, 270):
+            self.orient()
+
+    # ---- frame analysis: exposure tools and autofocus, off the UI thread
+
+    def set_lens(self, pos):
+        if not self.has_lens:
+            return
+        try:
+            with open(LENS, "w") as f:
+                f.write(str(int(pos)))
+            if pos >= 0:
+                self.lens_pos = int(pos)
+        except OSError:
+            self.has_lens = False
+
+    def analyse(self):
+        last, n = 0.0, 0
+        while not self.quit:
+            now = time.monotonic()
+            every = .5 if self.rec else .12  # the encoder needs the cores while recording
+            if not (self.af or self.af_req) and now - last < every:
+                time.sleep(.02)
+                continue
+            data = None
+            with self.tap_lock:  # the frame is copied out and given back before anything slow
+                sample = self.tap.emit("try-pull-sample", 50 * Gst.MSECOND) if self.tap else None
+                if sample:
+                    st = sample.get_caps().get_structure(0)
+                    w, h, fmt = st.get_value("width"), st.get_value("height"), st.get_value("format")
+                    buf = sample.get_buffer()
+                    ok, info = buf.map(Gst.MapFlags.READ)
+                    if ok:
+                        data = bytes(info.data)
+                        buf.unmap(info)
+                    del sample, buf
+                    self.frame = data and (data, w, h, fmt)
+            if data is None:
+                time.sleep(.05)
+                continue
+            arr = np.frombuffer(data, np.uint8)[:h * (len(data) // h)].reshape(h, len(data) // h)[:, :w * 4].reshape(h, w, 4)
+            if fmt.startswith("BGR"):
+                arr = arr[:, :, [2, 1, 0, 3]]
+            if self.lens_ok():
+                self.focus_step(arr, now)
+            if now - last >= every:
+                last, n = now, n + 1
+                GLib.idle_add(self.assist, *self.tools(arr, n))
+
+    def sharpness(self, arr):
+        """edge energy around the focus point, scaled by brightness so exposure changes do not read as blur"""
+        h, w = arr.shape[:2]
+        u, v = self.meter or (.5, .5)
+        r = min(h, w) // 5
+        cx, cy = int(min(max(u * w, r), w - r)), int(min(max(v * h, r), h - r))
+        g = cv2.GaussianBlur(np.ascontiguousarray(arr[cy - r:cy + r, cx - r:cx + r, 1]), (0, 0), 1.0).astype(np.float32)
+        return float((cv2.Sobel(g, cv2.CV_32F, 1, 0) ** 2 + cv2.Sobel(g, cv2.CV_32F, 0, 1) ** 2).mean() / (g.mean() + 4) ** 2)
+
+    def focus_step(self, arr, now):
+        """one frame of autofocus; runs on the analysis thread"""
+        if not (self.S["focus"] is None or not self.manual):
+            self.af = None
+            return
+        if self.af_req:  # near the last good focus first, the whole range when there is none
+            self.af_req, self.af_wait, self.af_t = False, 2, now
+            self.af = lib.AFSearch(LENS_LO, LENS_HI, self.lens_pos if self.af_good is not None else None)
+            self.af_log = []
+            self.set_lens(self.af.pos)
+            return
+        # a hand moving the phone changes sharpness more than the lens does: no search while it moves.
+        # Compared as a handful of block means, which a change of focus leaves alone.
+        coarse = cv2.resize(arr[::8, ::8, 1], (8, 6), interpolation=cv2.INTER_AREA).astype(np.int16)
+        moving = self.af_coarse is not None and float(np.abs(coarse - self.af_coarse).mean()) > 3
+        self.af_coarse = coarse
+        self.af_calm = 0 if moving else self.af_calm + 1
+        if self.af and moving:
+            self.af, self.af_again = None, True
+            self.set_lens(LENS_REST if self.af_good is None else self.af_good)
+            return
+        if self.af_again and self.af_calm >= 6:
+            self.af_again, self.af_req = False, True
+            return
+        sharp = self.sharpness(arr)
+        if self.af:
+            if self.af_wait:  # the lens and the frames in flight settle
+                self.af_wait -= 1
+                return
+            self.af_log.append(f"{self.af.pos}:{sharp:.4g}")
+            af, self.af_wait = self.af, 2
+            if af.feed(sharp) is None:
+                if not af.sure:  # nothing to focus on: the position that is sharp from a metre out
+                    af.pos = LENS_REST
+                self.af_good = af.pos
+                self.af, self.af_ref, self.af_seen, self.af_t = None, None, [], now
+                self.note(f"af {'sure' if af.sure else 'flat'} -> {af.pos} | " + " ".join(self.af_log))
+                GLib.idle_add(self.focused)
+            self.set_lens(af.pos)
+        elif now - self.af_t > .4:
+            if self.af_ref is None:
+                self.af_ref = sharp
+            # continuous: refocus once the picture has changed and then held still again
+            self.af_seen = (self.af_seen + [sharp])[-4:]
+            mean = sum(self.af_seen) / len(self.af_seen)
+            still = len(self.af_seen) == 4 and max(self.af_seen) - min(self.af_seen) < .2 * mean and self.af_calm >= 4
+            if still and abs(mean - self.af_ref) > .35 * self.af_ref and now - self.af_t > 2.5 and not self.busy:
+                self.af_req = True
+
+    def note(self, text):
+        """focus diary in the cache: how the lens answers on real scenes"""
+        try:
+            path = os.path.join(GLib.get_user_cache_dir(), "phonecam-focus.log")
+            mode = "a" if os.path.exists(path) and os.path.getsize(path) < 200000 else "w"
+            with open(path, mode) as f:
+                f.write(time.strftime("%F %T ") + text + "\n")
+        except OSError:
+            pass
+
+    def focused(self):
+        self.finder.ring_ok = True
+        self.finder.queue_draw()
+        if "focus" in self.tiles:
+            self.update_tile("focus")
+
+    def tools(self, arr, n):
+        """histogram, clipping and the overlay picture (zebra, peaking, false colour) at 1/4 scale"""
+        S = self.S
+        y = cv2.cvtColor(np.ascontiguousarray(arr[::4, ::4, :3]), cv2.COLOR_RGB2GRAY)
+        hist = np.bincount(y.ravel() >> 2, minlength=64)
+        self.rgb = tuple(float(v) + 1 for v in arr[::16, ::16, :3].reshape(-1, 3).mean(0))
+        clip = (float((y <= 3).mean()), float((y >= 250).mean()))
+        ov = None
+        if self.manual and (S["zebra"] or S["falsecolor"] or S["peaking"] or self.param == "focus"):
+            ov = np.zeros(y.shape + (4,), np.uint8)
+            if S["falsecolor"]:
+                lut = np.zeros((256, 4), np.uint8)
+                lo = 0
+                for top, rgb in FALSE:
+                    hi = min(256, math.ceil(top * 2.55))
+                    lut[lo:hi, :3] = rgb if rgb else np.arange(lo, hi)[:, None]
+                    lo = hi
+                lut[:, 3] = 255
+                ov = lut[y]
+            elif S["zebra"]:
+                yy, xx = np.indices(y.shape)
+                stripe = ((xx + yy + n) // 3) % 2 == 0
+                hot = y >= S["zebra"] * 2.55
+                ov[hot & stripe] = (255, 255, 255, 255)
+                ov[hot & ~stripe] = (0, 0, 0, 255)
+            if S["peaking"] or self.param == "focus":
+                g = np.ascontiguousarray(arr[::2, ::2, 1])
+                edge = np.abs(cv2.Laplacian(cv2.GaussianBlur(g, (0, 0), .8), cv2.CV_16S, ksize=3)) > 28
+                eh, ew = y.shape
+                ov[edge[:eh * 2, :ew * 2].reshape(eh, 2, ew, 2).any(axis=(1, 3))] = (215, 25, 33, 255)
+        return hist, clip, ov
+
+    def assist(self, hist, clip, ov):
+        self.hist, self.clip = hist, clip
+        if self.scope.get_visible():
+            self.scope.queue_draw()
+        tex = None
+        if ov is not None:
+            h, w = ov.shape[:2]
+            tex = Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, GLib.Bytes.new(ov.tobytes()), w * 4)
+        if tex or self.finder.overlay:
+            self.finder.overlay = tex
+            self.finder.queue_draw()
+
+    def poll_sensor(self):
+        """what the automatic exposure chose, for the tiles and for locking"""
+        while not self.quit:
+            time.sleep(1)
+            if TESTSRC or not self.pipe or self.busy or not self.manual:
+                continue
+            try:
+                out = subprocess.run([os.path.join(BIN, "phonecam-raw"), "--viewfinder", self.cam[0]], check=True,
+                                     capture_output=True, text=True).stdout.split()
+                self.live = (float(out[0]), float(out[1]))
+                GLib.idle_add(lambda: [self.update_tile(k) for k in self.tiles] and False)
+            except (subprocess.CalledProcessError, ValueError, IndexError, OSError):
+                pass
+
+    def tick(self):
+        """once a second: recording clock, idle release of the sensor"""
+        if self.rec:
+            self.update_status()
+        elif self.pipe and not self.busy and not self.count_id and time.monotonic() - self.touched > IDLE_S:
+            self.release()
+            self.paused = True
+            self.show_msg("Paused\nTap to resume")
+        return not self.quit
+
+    # ---- video
+
+    def microphone(self):
+        """the default input, if the phone has one that is not a loopback of its own speaker"""
+        try:
+            out = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        names = [l.split("\t")[1] for l in out.splitlines() if "\t" in l and not l.split("\t")[1].endswith(".monitor")]
+        return names[0] if names else None
+
+    def on_element(self, _bus, m):
+        s = m.get_structure()
+        if s and s.get_name() == "level":
+            self.audio = max(s.get_value("peak"))
+            self.scope.queue_draw()
+
+    def on_drop(self, *_):
+        if self.rec:
+            self.rec["drops"] += 1
+
+    def record_ui(self, on):
+        self.shutter_art.queue_draw()
+        for wdg in (self.flip, self.gear, self.thumb):
+            wdg.set_sensitive(not on and (wdg is not self.thumb or bool(self.last)))
+        if not on:
+            self.audio = None
+        self.update_status()
+
+    def record(self):
+        os.makedirs(VIDS, exist_ok=True)
+        if shutil.disk_usage(VIDS).free < 200e6:
+            return self.shot_failed("Storage full")
+        path = os.path.join(VIDS, time.strftime("VID_%Y%m%d_%H%M%S.mp4"))
+        self.sheet_open(False)
+        if self.S["lock"] and not self.locked and not TESTSRC:
+            self.show_msg("Locking exposure")
+            self.shutter.set_sensitive(False)
+            return threading.Thread(target=self.lock, daemon=True).start()
+        mic = self.start(record=path)
+        if not self.pipe:
+            self.locked = None
+            return
+        self.rec = dict(path=path, t0=time.monotonic(), drops=0, mic=bool(mic))
+        self.record_ui(True)
+
+    def lock(self):
+        """worker thread: freeze what the automatics chose. The ISP has no "hold" for white balance
+        (off means unity gains), so find the gains that keep grey grey, as its grey-world AWB does."""
+        try:
+            out = subprocess.run([os.path.join(BIN, "phonecam-raw"), "--viewfinder", self.cam[0]], check=True,
+                                 capture_output=True, text=True).stdout.split()
+            exp, gain = float(out[0]), float(out[1])
+        except (subprocess.CalledProcessError, ValueError, IndexError, OSError):
+            exp, gain = self.live
+        g = [1.5, 1.8]
+        if self.S["wb"]:
+            g = list(lib.kelvin_gains(self.S["wb"], self.S["tint"]))
+        else:
+            for _ in range(6):
+                self.locked = (exp, gain, tuple(g))
+                GLib.idle_add(self.push_controls)
+                time.sleep(.45)
+                r, gm, b = self.rgb
+                if abs(r / gm - 1) < .03 and abs(b / gm - 1) < .03:
+                    break
+                # the picture is gamma encoded: a channel 10% low needs about 25% more gain
+                g = [min(max(g[0] * (gm / r) ** 1.8, 1.0), 3.99), min(max(g[1] * (gm / b) ** 1.8, 1.0), 3.99)]
+        self.locked = (exp, gain, tuple(g))
+        GLib.idle_add(lambda: self.shutter.set_sensitive(True) or self.record())
+
+    def stop_record(self):
+        if self.rec.get("stopping"):
+            return
+        self.rec["stopping"] = True
+        self.shutter.set_sensitive(False)
+        self.pipe.send_event(Gst.Event.new_eos())
+        GLib.timeout_add(5000, lambda: self.rec and self.recorded() and False)
+
+    def recorded(self):
+        """the file is closed: back to the plain viewfinder"""
+        rec, self.rec, self.locked = self.rec, None, None
+        if not rec:
+            return
+        snap = self.still()
+        self.shutter.set_sensitive(True)
+        self.record_ui(False)
+        if self.closing:
+            if not self.pending and not self.busy:
+                self.shutdown()
+                self.destroy()
+            return
+        if self.asleep:
+            self.release()
+        else:
+            self.start()
+        if os.path.exists(rec["path"]) and os.path.getsize(rec["path"]) > 1000:
+            self.last = rec["path"]
+            if snap:
+                self.show_thumb(snap, self.finder.rot, self.finder.mirror)
+            self.thumb.set_sensitive(True)
+            print(rec["path"], flush=True)
+        else:
+            self.shot_failed("Recording failed")
+
+    # ---- photo
+
+    def shutter_clicked(self, *_):
+        self.touched = time.monotonic()
+        if self.paused:
+            return self.start()
+        if self.S["mode"] == "video":
+            return self.stop_record() if self.rec else self.record()
+        if self.count_id:  # a second press cancels the timer
+            GLib.source_remove(self.count_id)
+            self.count_id = self.finder.count = 0
+            return self.finder.queue_draw()
+        if self.busy or not self.pipe or self.pending >= 3:
+            return
+        if self.S["timer"]:
+            self.finder.count = self.S["timer"]
+            self.count_id = GLib.timeout_add(1000, self.countdown)
+            return self.finder.queue_draw()
+        self.capture()
+
+    def countdown(self):
+        self.finder.count -= 1
+        self.finder.queue_draw()
+        if self.finder.count:
+            return True
+        self.count_id = 0
+        self.capture()
+        return False
+
+    def capture(self):
+        S = self.S
+        name, _p, rot, _mirror, modes = self.cam
+        _, mode, frames, size = modes[min(S["size"], len(modes) - 1)]
+        zoom = self.finder.zoom
+        if zoom > 1:  # zoomed shots are 12 MP or the sensor's native size; 2x and up crop the full-res readout
+            if name == "back" and zoom >= 1.9:
+                mode, frames = "full", 3
+            size = modes[0][3]
+        if not S["stack"]:
+            frames = 1
+        turn = (rot - self.theta if name == "back" else rot + self.theta) % 360  # the way the phone is held now
+        dev = ["--zoom", f"{zoom:g}", "--size", str(size), "--rot", str(turn)]
+        if self.meter:
+            dev += ["--meter", "%.4f,%.4f" % self.meter]
+        if FILTERS[S["filter"]][1]:
+            dev += ["--matrix", ",".join(f"{v:.5f}" for r in FILTERS[S["filter"]][1] for v in r)]
+        if S["aspect"] != "4:3":
+            dev += ["--aspect", f"{dict(lib.ASPECTS)[S['aspect']]:.4f}"]
+        man = (None, None)
+        if S["mode"] == "pro":
+            man = (S["shutter"], S["iso"])
+            if S["wb"]:
+                dev += ["--wb", "%.4f,%.4f" % lib.kelvin_gains(S["wb"], S["tint"])]
+            if S["ev"]:
+                dev += ["--ev", f"{S['ev']:.3f}"]
+            if all(man):  # fully manual: the photo is as bright as the settings make it
+                dev += ["--gain", "1"]
+        self.busy = True
+        for w in (self.shutter, self.flip, self.gear):
+            w.set_sensitive(False)
+        self.shutter.add_css_class("snap")
+        self.flash.add_css_class("on")
+        GLib.timeout_add(70, lambda: self.flash.remove_css_class("on") or self.shutter.remove_css_class("snap"))
+        # the frame on screen now is the instant thumbnail and stays up while the sensor is busy
+        snap = self.still()
+        if snap:
+            self.show_thumb(snap, self.finder.rot, self.finder.mirror)
+        self.finder.set_paintable(snap)
+        os.makedirs(PICS, exist_ok=True)
+        path = output_name(time.time())
+        threading.Thread(target=self.grab, args=(name, mode, frames, path, dev, man, S["flash"] == "FLASH", S["stack"],
+                                                 S["dng"], S["mode"] == "pro" and S["ev"] or 0.0), daemon=True).start()
+
+    def grab(self, name, mode, frames, path, dev, man, flash, stack, dng, ev):
+        """worker thread: viewfinder exposure, raw frames to disk, viewfinder back, develop queued"""
+        t0 = time.monotonic()
+        while (self.af or self.af_req) and time.monotonic() - t0 < 2.5:  # let a focus sweep finish
+            time.sleep(.05)
+        if flash:
+            self.set_led(True)
+            time.sleep(.7)  # the automatic exposure takes the light in
+        try:
+            exp, gain = map(float, subprocess.run([os.path.join(BIN, "phonecam-raw"), "--viewfinder", name],
+                                                  check=True, capture_output=True, text=True).stdout.split())
+        except (subprocess.CalledProcessError, ValueError, OSError):
+            exp, gain = 30000.0, 4.0
+        exp, gain = man[0] or exp, man[1] or gain
+        if not any(man):
+            exp *= 2.0 ** min(ev, 0)  # negative compensation also protects the highlights in the raw data
+            if exp > HANDHELD_US:
+                gain, exp = gain * exp / HANDHELD_US, HANDHELD_US
+        if gain > DARK_GAIN:
+            if stack:
+                frames *= 2
+            if name == "back" and mode == "full":  # on-chip remosaic breaks into 2x2 blocks at low SNR: bin, then scale up
+                mode, frames = "bin", 12 if stack else 1
+                i = dev.index("--size") + 1
+                dev = dev[:i] + [dev[i] if dev[i] != "0" else "8160"] + dev[i + 1:]
+        dev = dev + ["--exif", f"{exp:.0f},{gain * 100:.0f}"] + (["--dng", path[:-4] + ".dng"] if dng else [])
+        stopped = threading.Event()
+        GLib.idle_add(lambda: self.stop() or stopped.set())
+        stopped.wait()
+        raw = os.path.join(GLib.get_user_cache_dir(), os.path.basename(path) + ".raw")
+        err = geo = None
+        try:
+            geo = subprocess.run([os.path.join(BIN, "phonecam-raw"), name, mode, str(frames), f"{exp:.0f}",
+                                  f"{gain:.3f}", raw], check=True, capture_output=True, text=True).stdout.split()
+        except subprocess.CalledProcessError as e:
+            err = ((e.stderr or "").strip().splitlines()[-1:] or [str(e)])[0]
+        except OSError as e:
+            err = str(e)
+        if flash:
+            self.set_led(False)
+        GLib.idle_add(self.grabbed, raw, geo, path, frames, dev, err)
+
+    def grabbed(self, raw, geo, path, frames, dev, err):
+        self.busy = False
+        for w in (self.shutter, self.flip, self.gear):
+            w.set_sensitive(True)
+        if self.asleep:
+            self.release()
+        elif not self.closing:
+            self.start()
+        if err:
+            if os.path.exists(raw):
+                os.unlink(raw)
+            self.shot_failed(err)
+            if self.closing and not self.pending:
+                self.destroy()
+            return
+        self.pending += 1
+        self.ring.queue_draw()
+        self.jobs.put((raw, geo, path, frames, dev))
+
+    def developer(self):
+        """one develop at a time, at low priority so the viewfinder stays smooth"""
+        while True:
+            raw, (w, h, stride, _rot, bayer, ccm), path, frames, dev = self.jobs.get()
+            err = None
+            try:
+                p = subprocess.Popen(["nice", "-n", "10", os.path.join(BIN, "phonecam-develop"), raw, w, h, stride,
+                                      path + ".part.jpg", "--frames", str(frames), "--bayer", bayer,
+                                      "--ccm", ccm, *dev], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for line in p.stdout:
+                    try:
+                        GLib.idle_add(self.set_progress, float(line))
+                    except ValueError:
+                        pass
+                errs = p.stderr.read()
+                if p.wait():
+                    err = (errs.strip().splitlines()[-1:] or [f"develop exited {p.returncode}"])[0]
+                else:
+                    os.replace(path + ".part.jpg", path)
+            except OSError as e:
+                err = str(e)
+            finally:
+                for f in (raw, path + ".part.jpg"):
+                    if os.path.exists(f):
+                        os.unlink(f)
+            GLib.idle_add(self.developed, None if err else path, err)
+
+    def set_progress(self, f):
+        self.progress = f
+        self.ring.queue_draw()
+
+    def developed(self, path, err):
+        self.pending -= 1
+        self.progress = 0.0
+        self.ring.queue_draw()
+        if err:
+            self.shot_failed(err)
+        else:
+            self.last = path
+            self.set_thumb(path)
+            print(path, flush=True)
+        if self.closing and not self.pending and not self.busy:
+            self.shutdown()
+            self.destroy()
+
+    def shot_failed(self, err):
+        self.show_msg(f"Capture failed\n{err}")
+        GLib.timeout_add(4000, lambda: self.show_msg(""))
+
+    def shutdown(self):
+        """nothing keeps running or powered once the window is gone"""
+        self.quit = True
+        self.stop()
+        self.set_lens(-1)
+        self.set_led(False)
+        ssc = getattr(self, "ssc", None)
+        if ssc:
+            ssc.kill()
+
+    def on_suspended(self, *_):
+        """screen off, locked or covered: the sensor and the software ISP stop (they are the phone's
+        biggest heater), a recording is closed properly first; back in view, the viewfinder returns"""
+        self.asleep = self.props.suspended
+        if os.environ.get("PHONECAM_DEBUG"):
+            print("suspended", self.asleep, file=sys.stderr, flush=True)
+        if not self.asleep:
+            if not self.pipe and not self.busy and not self.closing:
+                self.touched = time.monotonic()
+                self.start()
+        elif self.rec:
+            self.stop_record()  # recorded() sees asleep and leaves the camera off
+        elif not self.busy:  # a photo being grabbed finishes; grabbed() then leaves the camera off
+            self.release()
+
+    def release(self):
+        self.stop()
+        self.set_lens(-1)
+        self.set_led(False)
+
+    def on_close(self, *_):
+        """photos still in the queue get finished with the window hidden"""
+        if self.rec:  # the file is only playable once it is closed properly
+            self.closing = True
+            self.stop_record()
+            self.set_visible(False)
+            return True
+        self.stop()
+        self.set_lens(-1)
+        self.set_led(False)
+        self.save()
+        if self.pending or self.busy:
+            self.closing = True
+            self.set_visible(False)
+            return True
+        self.shutdown()
+        return False
+
+    def set_thumb(self, path):
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 104, 104, True)
+            self.show_thumb(Gdk.Texture.new_for_pixbuf(pb))
+        except GLib.Error:
+            pass
+        self.thumb.set_sensitive(True)
+
+    def open_last(self, *_):
+        if not self.last:
+            return
+        try:
+            Gio.Subprocess.new(["phonegallery", self.last], Gio.SubprocessFlags.NONE)
+        except GLib.Error:  # no gallery installed
+            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(self.last), None)
+
+
+def output_name(t):
+    return os.path.join(PICS, time.strftime("IMG_%Y%m%d_%H%M%S.jpg", time.localtime(t)))
+
+
+def main():
+    app = Gtk.Application(application_id="org.phonegluewc.Camera", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(a):
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, 800)
+        Cam(a).present()
+
+    app.connect("activate", activate)
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    assert "/Camera/IMG_1970010" in output_name(0)
+    assert set(DEFAULTS) >= {r[0] for r in ROWS} and all(len(v) == 7 and max(v) < 32 for v in FONT.values())
+    sys.exit(main())

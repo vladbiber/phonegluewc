@@ -1,0 +1,80 @@
+Wallpapers shipped with phonegluewc.
+
+01-black-grain.jpg, 02-dark-gradient.jpg, 03-dot-matrix.jpg, 04-soft-shapes.jpg,
+05-aurora-dark.jpg, 06-ribbons-dark.jpg, 07-dusk.jpg, 14-sunrise.jpg, 15-teal.jpg,
+20-aurora-light.jpg, 21-ribbons-light.jpg, 22-light-gradient.jpg:
+  generated, CC0, by the project. Rebuild them with: sh generate.sh
+
+The rest are crops of Wikimedia Commons photos released under CC0 1.0
+(https://creativecommons.org/publicdomain/zero/1.0/): no attribution required, listed anyway.
+Each was cropped to 1080x2400 and re-encoded as JPEG with metadata stripped.
+
+08-night-lake.jpg
+  title:   Night Sky @ Baiersdorf - Flickr - markus spiske.jpg
+  author:  Markus Spiske from Forchheim, Bavaria Upper Franconia
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Night_Sky_@_Baiersdorf_-_Flickr_-_markus_spiske.jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/d/d5/Night_Sky_%40_Baiersdorf_-_Flickr_-_markus_spiske.jpg
+
+09-desert-night.jpg
+  title:   Night sky in Jordan desert, Oct 2023.jpeg
+  author:  adspedia
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Night_sky_in_Jordan_desert,_Oct_2023.jpeg
+  file:    https://upload.wikimedia.org/wikipedia/commons/9/9b/Night_sky_in_Jordan_desert%2C_Oct_2023.jpeg
+
+10-star-glow.jpg
+  title:   Түнкү асман (Офринио, Греция).jpg
+  author:  Dimitris Adalialis
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:%D0%A2%D2%AF%D0%BD%D0%BA%D2%AF_%D0%B0%D1%81%D0%BC%D0%B0%D0%BD_(%D0%9E%D1%84%D1%80%D0%B8%D0%BD%D0%B8%D0%BE,_%D0%93%D1%80%D0%B5%D1%86%D0%B8%D1%8F).jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/6/62/%D0%A2%D2%AF%D0%BD%D0%BA%D2%AF_%D0%B0%D1%81%D0%BC%D0%B0%D0%BD_%28%D0%9E%D1%84%D1%80%D0%B8%D0%BD%D0%B8%D0%BE%2C_%D0%93%D1%80%D0%B5%D1%86%D0%B8%D1%8F%29.jpg
+
+11-dark-sea.jpg
+  title:   Seascape, St Leonards-on-sea 01.jpg
+  author:  Poliphilo
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Seascape,_St_Leonards-on-sea_01.jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/1/1e/Seascape%2C_St_Leonards-on-sea_01.jpg
+
+12-fjord-stars.jpg
+  title:   Stars and Milky Way over Åbyfjorden 4.jpg
+  author:  W.carter
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Stars_and_Milky_Way_over_%C3%85byfjorden_4.jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/f/f7/Stars_and_Milky_Way_over_%C3%85byfjorden_4.jpg
+
+13-raindrops.jpg
+  title:   Bokeh raindrops on a window 1.jpg
+  author:  W.carter
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Bokeh_raindrops_on_a_window_1.jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/0/01/Bokeh_raindrops_on_a_window_1.jpg
+
+16-blue-gradient.jpg
+  title:   Dark to light blue sky.jpg
+  author:  TheUltimateGrass
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Dark_to_light_blue_sky.jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/3/38/Dark_to_light_blue_sky.jpg
+
+17-fog-rail.jpg
+  title:   Railway lost in woods and morning fog (50584342811).jpg
+  author:  Ted Moravec
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Railway_lost_in_woods_and_morning_fog_(50584342811).jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/4/49/Railway_lost_in_woods_and_morning_fog_%2850584342811%29.jpg
+
+18-grey-cloud.jpg
+  title:   Thunder cloud over Gåseberg.jpg
+  author:  W.carter
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Thunder_cloud_over_G%C3%A5seberg.jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/5/5f/Thunder_cloud_over_G%C3%A5seberg.jpg
+
+19-altocumulus.jpg
+  title:   Altocumulus clouds in evening Chhindwara.jpg
+  author:  Kaushlendrapathe
+  licence: CC0
+  source:  https://commons.wikimedia.org/wiki/File:Altocumulus_clouds_in_evening_Chhindwara.jpg
+  file:    https://upload.wikimedia.org/wikipedia/commons/6/64/Altocumulus_clouds_in_evening_Chhindwara.jpg

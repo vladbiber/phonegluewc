@@ -1,0 +1,55 @@
+#!/bin/sh
+# Tells phonegluewc which way the phone is held: normal, left-up, right-up or bottom-up.
+# Sources, first found: $FAKE_STATE/orientation, iio-sensor-proxy (monitor-sensor), the accelerometer in /sys/bus/iio (PHONE_IIO_DIR for a fake tree).
+comp=$PPID
+send() { phonegluewc-msg do orientation "$1" >/dev/null 2>&1; }
+alive() { kill -0 "$comp" 2>/dev/null; }
+
+if [ -n "${FAKE_STATE:-}" ]; then
+	last=
+	while alive; do
+		o=$(cat "$FAKE_STATE/orientation" 2>/dev/null)
+		[ -n "$o" ] && [ "$o" != "$last" ] && send "$o"
+		last=$o
+		sleep 0.3
+	done
+	exit 0
+fi
+
+IIO=${PHONE_IIO_DIR:-}
+if [ -z "$IIO" ] && command -v monitor-sensor >/dev/null 2>&1; then
+	# it claims the accelerometer over D-Bus and prints each change
+	monitor-sensor --accel 2>/dev/null | while read -r line; do
+		case "$line" in
+		*"orientation changed:"*) send "${line##*: }" ;;
+		*"Has accelerometer (orientation: "*) o=${line#*orientation: }; send "${o%%,*}" ;;
+		esac
+		alive || exit 0
+	done
+	exit 0
+fi
+
+dev=
+for d in "${IIO:-/sys/bus/iio/devices}"/iio:device*; do
+	[ -r "$d/in_accel_x_raw" ] && [ -r "$d/in_accel_y_raw" ] && { dev=$d; break; }
+done
+[ -n "$dev" ] || exit 0
+mm=
+for f in "$dev/in_accel_mount_matrix" "$dev/mount_matrix"; do [ -r "$f" ] && { mm=$f; break; }; done
+# the chip's axes turned into the panel's by the mount matrix; at rest the axis pointing up reads +g
+last=
+while alive; do
+	o=$( { cat "$dev/in_accel_x_raw" "$dev/in_accel_y_raw"; cat "$dev/in_accel_z_raw" 2>/dev/null || echo 0; [ -n "$mm" ] && cat "$mm"; } 2>/dev/null | awk '
+		NR <= 3 { v[NR] = $1 + 0; next }
+		{ n = split($0, r, ";"); for (i = 1; i <= 3 && i <= n; i++) { split(r[i], c, ","); for (j = 1; j <= 3; j++) m[i, j] = c[j] + 0 }; mm = n >= 3 }
+		END {
+			if (!mm) for (i = 1; i <= 3; i++) for (j = 1; j <= 3; j++) m[i, j] = i == j
+			x = m[1,1] * v[1] + m[1,2] * v[2] + m[1,3] * v[3]
+			y = m[2,1] * v[1] + m[2,2] * v[2] + m[2,3] * v[3]
+			ax = x < 0 ? -x : x; ay = y < 0 ? -y : y
+			if (ay > 2 * ax) print (y > 0 ? "normal" : "bottom-up")
+			else if (ax > 2 * ay) print (x < 0 ? "left-up" : "right-up")
+		}')
+	[ -n "$o" ] && [ "$o" != "$last" ] && send "$o" && last=$o
+	sleep 0.5
+done

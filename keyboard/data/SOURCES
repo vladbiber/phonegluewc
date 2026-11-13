@@ -1,0 +1,29 @@
+words.tsv is built by tools/mkwords.py. The base holds English only; other languages
+come as downloaded packs built the same way, see ../packs.
+
+Word frequencies: FrequencyWords by Hermit Dave
+https://github.com/hermitdave/FrequencyWords (content/2018, en, and ro in its pack)
+Licence: CC BY-SA 4.0. words.tsv is an adapted work and carries the same licence:
+https://creativecommons.org/licenses/by-sa/4.0/
+Changes: spelling filtered, diacritics normalised, counts merged, list shortened.
+
+The LibreOffice ro_RO and en_US hunspell dictionaries were used to choose which words
+to keep. They were read while building and are not included.
+
+emoji.tsv is built by tools/mkemoji.py.
+
+Emoji list and order: Unicode emoji-test.txt, Emoji 18.0
+https://www.unicode.org/Public/emoji/latest/emoji-test.txt
+Search words: Unicode CLDR annotations, en and ro
+https://github.com/unicode-org/cldr (common/annotations)
+Licence: Unicode License v3 (Unicode-3.0), copied in LICENSE-UNICODE.
+Changes: skin tone variants folded into templates, words folded to plain letters.
+
+bigrams.tsv is built by tools/mkbigrams.py.
+
+Next word statistics: Tatoeba sentences, one export per language
+https://tatoeba.org/en/downloads
+Licence: CC BY 2.0 FR, attribution to Tatoeba and its contributors:
+https://creativecommons.org/licenses/by/2.0/fr/
+Changes: only counts of adjacent word pairs are kept, up to ten next words for each word,
+plus the commonest words overall; no sentence is included.

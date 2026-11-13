@@ -1,0 +1,27 @@
+--- a/shell/QuickModel.qml	2026-11-12 21:20:49.577281128 +0200
++++ b/shell/QuickModel.qml	2026-11-12 21:20:49.591148472 +0200
+@@ -132,7 +132,7 @@
+         case "nfc": return rfToggle("nfc", "NFC", "nfc");
+         case "location": return rfToggle("gps", "Location", "pin");
+         case "glyph": return { avail: q.glyph !== undefined, on: parseInt(q.glyphval) > 0, label: "Glyph", icon: "glyph", page: "",
+-            tap: () => root.act(["brightnessctl", "-q", "--class=leds", "-d", q.glyph, "set", parseInt(q.glyphval) > 0 ? "0" : "100%"]) };
++            tap: () => root.act(["phoneglyph", "toggle"]) };
+         case "calc": return app("calc", "Calculator", "calc");
+         case "clock": return app("clock", "Timer", "clock");
+         case "camera": return app("camera", "Camera", "camera");
+@@ -199,12 +199,9 @@
+ command -v powerprofilesctl >/dev/null && v=$(powerprofilesctl get 2>/dev/null) && echo "profile=$v"
+ command -v fbcli >/dev/null && echo fbcli=1
+ command -v pw-play >/dev/null || command -v paplay >/dev/null && echo player=1
+-if command -v brightnessctl >/dev/null; then
+-	g=$(ls "$1/leds" 2>/dev/null | grep -iE 'glyph|aw20036' | head -1)
+-	if [ -n "$g" ]; then
+-		echo "glyph=$g"
+-		echo "glyphval=$(cat "$1/leds/$g/brightness" 2>/dev/null)"
+-	fi
++if command -v phoneglyph >/dev/null; then
++	echo glyph=aw21018
++	grep -q '"on": true' /run/phoneglyph/state.json 2>/dev/null && echo glyphval=1 || echo glyphval=0
+ fi
+ exit 0
+ `

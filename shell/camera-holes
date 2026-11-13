@@ -1,0 +1,3 @@
+# device tree compatible, then the hole in pixels of a 1080 wide panel: x y diameter
+# nothing,spacewar: LineageOS device_nothing_Spacewar config_mainBuiltInDisplayCutout, centre within 1 px of gmobile's panel data
+nothing,spacewar 89.3 42.31 52.38

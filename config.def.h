@@ -4,21 +4,21 @@
                         ((hex >> 8) & 0xFF) / 255.0f, \
                         (hex & 0xFF) / 255.0f }
 /* appearance - the non-const values can be overridden at runtime from
- * ~/.config/gluewc/config.conf */
+ * ~/.config/phonegluewc/config.conf */
 static const int sloppyfocus               = 1;  /* focus follows mouse */
 static int warpcursor                      = 1;  /* warp cursor to focused window on keyboard focus, like nvwm */
 static const int bypass_surface_visibility = 0;  /* 1 means idle inhibitors will disable idle tracking even if it's surface isn't visible  */
-static unsigned int borderpx               = 2;  /* border pixel of windows */
+static unsigned int borderpx               = 0;  /* border pixel of windows */
 static int gappx                           = 8;  /* gap around tiled windows */
 static float rootcolor[]                   = COLOR(0x000000ff);
 static float bordercolor[]                 = COLOR(0x2f3549ff);
 static float focuscolor[]                  = COLOR(0x7aa2f7ff);
 static float normalmodecolor[]             = COLOR(0xe0af68ff); /* focused border while in normal mode */
 static int unfocused_borders                = 0;  /* 1 keeps the dim border on unfocused windows */
-static int corner_radius                   = 8;  /* rounded corner radius, 0 disables */
+static int corner_radius                   = 0;  /* rounded corner radius, 0 disables */
 static int blurenabled                     = 0;  /* backdrop blur behind transparent windows */
-static int blur_passes                     = 3;
-static int blur_radius                     = 5;
+static int blur_passes                     = 4;
+static int blur_radius                     = 8;
 static float win_opacity                   = 1.0f; /* window opacity when transparency is on */
 static int opacityenabled                  = 1;  /* toggled at runtime with wm:toggle_opacity */
 static int animations                      = 1;  /* position animations (open/retile/workspace) */
@@ -27,7 +27,7 @@ static int animation_duration              = 200; /* ms, retile and workspace mo
  * AnimSlide moves it in from below, AnimFade only fades, AnimNone is instant */
 static int animation_type_open             = AnimZoom;
 static int animation_type_close            = AnimZoom;
-static int animation_duration_open         = 300; /* ms */
+static int animation_duration_open         = 250; /* ms */
 static int animation_duration_close        = 250; /* ms */
 static float zoom_initial_ratio            = 0.72f; /* size an opening window starts at */
 static float zoom_end_ratio                = 0.76f; /* size a closing window ends at */
@@ -66,7 +66,7 @@ static const MonitorRule monrules[] = {
 	/* example of a HiDPI laptop monitor:
 	{ "eDP-1",    2,    WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1 }, */
 	/* defaults */
-	{ NULL,       1,    WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1 },
+	{ NULL,       2.75, WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1 },
 };
 
 /* keyboard */
@@ -136,7 +136,7 @@ static const enum libinput_config_tap_button_map button_map = LIBINPUT_CONFIG_TA
 
 /* Volume is driven by whichever helper is installed: wpctl comes with
  * WirePlumber and is there on any PipeWire system, pactl with the PulseAudio
- * tools. The backlight goes through gluewc-backlight, which wraps
+ * tools. The backlight goes through phonegluewc-backlight, which wraps
  * brightnessctl or light and steps 5% down to 10%, then 1% down to 0. */
 #define VOLCMD(wp, pa) SHCMD("if command -v wpctl >/dev/null 2>&1; then " \
 	"wpctl " wp "; else pactl " pa "; fi")
@@ -144,14 +144,14 @@ static const enum libinput_config_tap_button_map button_map = LIBINPUT_CONFIG_TA
 #define VOLDOWN VOLCMD("set-volume @DEFAULT_AUDIO_SINK@ 5%-", "set-sink-volume @DEFAULT_SINK@ -5%")
 #define VOLMUTE VOLCMD("set-mute @DEFAULT_AUDIO_SINK@ toggle", "set-sink-mute @DEFAULT_SINK@ toggle")
 #define MICMUTE VOLCMD("set-mute @DEFAULT_AUDIO_SOURCE@ toggle", "set-source-mute @DEFAULT_SOURCE@ toggle")
-#define BRTUP   SHCMD("gluewc-backlight up")
-#define BRTDOWN SHCMD("gluewc-backlight down")
+#define BRTUP   SHCMD("phonegluewc-backlight up")
+#define BRTDOWN SHCMD("phonegluewc-backlight down")
 
 /* Screenshots. grim takes the picture, slurp draws the crop rectangle and
  * wl-copy puts it on the clipboard. slurp exits non-zero when the selection
  * is cancelled with Escape, which is what stops the shot from being taken. */
 #define SHOTDIR "${XDG_PICTURES_DIR:-$HOME/Pictures}/Screenshots"
-#define SHOTNAME SHOTDIR "/gluewc-$(date +%Y%m%d-%H%M%S).png"
+#define SHOTNAME SHOTDIR "/phonegluewc-$(date +%Y%m%d-%H%M%S).png"
 #define SHOTFULL SHCMD("mkdir -p " SHOTDIR " && grim " SHOTNAME)
 #define SHOTAREA SHCMD("box=$(slurp) || exit 0; mkdir -p " SHOTDIR \
 	" && grim -g \"$box\" " SHOTNAME)

@@ -1,0 +1,27 @@
+--- a/shell/Phone.qml	2026-11-12 21:39:47.601018747 +0200
++++ b/shell/Phone.qml	2026-11-12 21:39:47.617174123 +0200
+@@ -335,9 +335,10 @@
+     }
+     function runButton(action) {
+         console.info("button action " + action);
+-        if (action === "camera")
+-            toast("No camera app yet");
+-        else if (action === "screenshot" && (lockTyped || removeEntry !== null))
++        if (action === "camera") {
++            const cam = apps.find(e => (e.categories || []).includes("Camera")) || apps.find(e => /camera/i.test(e.id + " " + e.name));
++            if (cam) launch(cam); else toast("No camera app yet");
++        } else if (action === "screenshot" && (lockTyped || removeEntry !== null))
+             toast("No screenshot while a password is being typed");
+         else if (action !== "none" && !buttonRun.running) {
+             buttonRun.command = ["sh", Quickshell.shellDir + "/button.sh", action];
+--- a/shell/QuickModel.qml	2026-11-12 21:39:47.601061431 +0200
++++ b/shell/QuickModel.qml	2026-11-12 21:39:47.617415416 +0200
+@@ -59,7 +59,7 @@
+     readonly property var shortcuts: ({
+         calc: entry(null, "Calculator"),
+         clock: entry(null, "Clock"),
+-        camera: entry(/camera/i, "Camera"),
++        camera: entry(null, "Camera") || entry(/camera/i, ""),
+         qr: entry(/\bqr|qr\b/i, ""),
+         notes: entry(/notes?\b/i, ""),
+         share: entry(/localsend|warpinator|kdeconnect/i, ""),

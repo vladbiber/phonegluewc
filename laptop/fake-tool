@@ -1,0 +1,204 @@
+#!/bin/sh
+# Stands in for a system tool in the laptop window: answers from files in FAKE_STATE, changes nothing real.
+tool=${0##*/}
+S=${FAKE_STATE:?}
+SYS=$FAKE_STATE/../sys
+printf '%s %s\n' "$tool" "$*" >>"$S/calls.log"
+get() { cat "$S/$1" 2>/dev/null || printf '%s\n' "$2"; }
+put() { printf '%s\n' "$2" >"$S/$1"; }
+rfset() { # TYPE blocked|unblocked
+	put "rf_$1" "$2"
+	case $1:$2 in
+	wlan:blocked) put wifi disabled ;; wlan:unblocked) put wifi enabled ;;
+	bluetooth:blocked) put bt no ;; bluetooth:unblocked) put bt yes ;;
+	wwan:blocked) put data disconnected ;; wwan:unblocked) put data connected ;;
+	esac
+}
+ssid() { if [ "$(get wifi enabled)" = enabled ]; then get ssid "Sample Home"; fi; }
+
+case $tool in
+nmcli)
+	F=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		-t | --ask) shift ;;
+		-f | -g) F=$2; shift 2 ;;
+		-w) shift 2 ;;
+		*) break ;;
+		esac
+	done
+	cell=$(get cell "Sample Mobile")
+	case "$F:$*" in
+	TYPE,STATE,CONNECTION:dev)
+		c=$(ssid)
+		if [ "$(get wifi enabled)" != enabled ]; then echo "wifi:unavailable:"
+		elif [ -n "$c" ]; then echo "wifi:connected:$c"
+		else echo "wifi:disconnected:"; fi
+		[ "$(get data connected)" = connected ] && echo "gsm:connected:$cell" || echo "gsm:disconnected:" ;;
+	DEVICE,TYPE:dev) printf 'wlan0:wifi\nwwan0:gsm\n' ;;
+	WIFI:radio | WIFI:g) get wifi enabled ;;
+	"ACTIVE,SIGNAL:dev wifi list"*) [ -n "$(ssid)" ] && printf 'yes:72\nno:40\n' ;;
+	"IN-USE,SIGNAL,SECURITY,SSID:dev wifi list"*)
+		[ "$(get wifi enabled)" = enabled ] || exit 0
+		c=$(ssid)
+		for n in "Sample Home:72:WPA2" "Sample Cafe:40:WPA2" "Sample Open:25:"; do
+			s=${n%%:*}; r=${n#*:}
+			[ "$s" = "$c" ] && u='*' || u=' '
+			echo "$u:${r%%:*}:${r#*:}:$s"
+		done ;;
+	"NAME,TYPE:con show --active")
+		c=$(ssid); [ -z "$c" ] || echo "$c:802-11-wireless"
+		[ "$(get hotspot off)" = on ] && echo Hotspot:802-11-wireless
+		[ "$(get vpn off)" = on ] && echo Sample VPN:vpn ;;
+	"NAME,TYPE:con show"*) printf 'Sample Home:802-11-wireless\n%s:gsm\n' "$cell" ;;
+	"NAME,TYPE,ACTIVE:con show"*)
+		[ "$(ssid)" = "Sample Home" ] && a=yes || a=no
+		[ "$(get data connected)" = connected ] && b=yes || b=no
+		printf 'Sample Home:802-11-wireless:%s\n%s:gsm:%s\n' "$a" "$cell" "$b" ;;
+	"NAME:con show --active") ssid; [ "$(get hotspot off)" = on ] && echo Hotspot ;;
+	"WIFI-PROPERTIES.AP:dev show"*) echo yes ;;
+	gsm.home-only:*) get homeonly no ;;
+	:radio\ wifi\ on) put wifi enabled; put rf_wlan unblocked ;;
+	:radio\ wifi\ off) put wifi disabled ;;
+	:device\ wifi\ hotspot) put hotspot on ;;
+	:con\ down\ Hotspot) put hotspot off ;;
+	:con\ up\ id\ "$cell") put data connected ;;
+	:con\ down\ id\ "$cell") put data disconnected ;;
+	:con\ up\ id\ *) shift 3; put ssid "$*" ;;
+	:con\ modify\ *gsm.home-only\ *) put homeonly "${*##* }" ;;
+	:con\ delete\ *) ;;
+	:dev\ wifi\ connect\ *) shift 3; put ssid "$*" ;;
+	:dev\ disconnect\ *) put ssid "" ;;
+	esac ;;
+bluetoothctl)
+	[ "${1:-}" = --timeout ] && shift 2
+	case "$*" in
+	show) printf 'Controller 00:00:00:00:00:01 (public)\n\tName: sample\n\tPowered: %s\n' "$(get bt yes)" ;;
+	"power on") put bt yes; [ "$(get rf_bluetooth unblocked)" = blocked ] && put rf_bluetooth unblocked; echo "Changing power on succeeded" ;;
+	"power off") put bt no; echo "Changing power off succeeded" ;;
+	"devices Connected") [ "$(get btconn 00:00:00:00:00:02)" = 00:00:00:00:00:02 ] && echo "Device 00:00:00:00:00:02 Sample Headphones" ;;
+	devices) printf 'Device 00:00:00:00:00:02 Sample Headphones\nDevice 00:00:00:00:00:03 Sample Speaker\n' ;;
+	"info "*)
+		[ "$(get btconn 00:00:00:00:00:02)" = "$2" ] && c=yes || c=no
+		printf 'Device %s\n\tPaired: yes\n\tConnected: %s\n\tIcon: audio-headphones\n\tBattery Percentage: 0x50 (80)\n' "$2" "$c" ;;
+	"connect "*) put btconn "$2" ;;
+	"disconnect "*) put btconn none ;;
+	esac ;;
+rfkill)
+	case "${1:-}" in
+	block | unblock)
+		[ "$1" = block ] && v=blocked || v=unblocked
+		if [ "$2" = all ]; then for t in wlan bluetooth wwan nfc gps; do rfset $t $v; done; else rfset "$2" $v; fi ;;
+	*) for t in wlan bluetooth wwan nfc gps; do echo "$t $(get rf_$t unblocked)"; done ;;
+	esac ;;
+wpctl)
+	case "${1:-}" in
+	get-volume) [ "$(get muted 0)" = 1 ] && echo "Volume: $(get vol 0.50) [MUTED]" || echo "Volume: $(get vol 0.50)" ;;
+	set-volume)
+		for v; do :; done
+		case $v in
+		*%) put vol "$(awk "BEGIN { printf \"%.2f\", ${v%\%} / 100 }")" ;;
+		*) put vol "$v" ;;
+		esac ;;
+	set-mute)
+		case $3 in
+		toggle) [ "$(get muted 0)" = 1 ] && put muted 0 || put muted 1 ;;
+		*) put muted "$3" ;;
+		esac ;;
+	set-default) put sink "$2" ;;
+	status)
+		d=$(get sink 46)
+		[ "$d" = 46 ] && a='*' b=' ' || a=' ' b='*'
+		printf 'Audio\n ├─ Devices:\n │      40. Sample Audio [alsa]\n │\n ├─ Sinks:\n │  %s   46. Sample Speakers [vol: %s]\n │  %s   47. Sample Headset [vol: %s]\n │\n ├─ Sources:\n │\n └─ Streams:\n' "$a" "$(get vol 0.50)" "$b" "$(get vol 0.50)"
+		[ "$(get micuse 0)" = 1 ] && printf '        70. Sample Recorder\n             71. input_FL < Mic:capture_FL [active]\n' ;;
+	esac ;;
+brightnessctl)
+	d=laptop-fake; c=backlight; v=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		-q) ;;
+		--class=*) c=${1#*=} ;;
+		-d) d=$2; shift ;;
+		set) v=$2; shift ;;
+		-m) m=1 ;;
+		esac
+		shift
+	done
+	f=$SYS/$c/$d
+	[ -d "$f" ] || { echo "Device '$d' not found." >&2; exit 1; }
+	max=$(cat "$f/max_brightness")
+	if [ -n "$v" ]; then
+		case $v in *%) v=$(( ${v%\%} * max / 100 )) ;; esac
+		echo "$v" >"$f/brightness"
+	elif [ -n "${m:-}" ]; then
+		cur=$(cat "$f/brightness")
+		echo "$d,$c,$cur,$(( cur * 100 / max ))%,$max"
+	fi ;;
+powerprofilesctl)
+	case "${1:-get}" in
+	get) get profile balanced ;;
+	set) put profile "$2" ;;
+	esac ;;
+mmcli)
+	case "$*" in
+	"-L -K") printf 'modem-list.length : 1\nmodem-list.value[1] : /org/freedesktop/ModemManager1/Modem/0\n' ;;
+	*-K)
+		printf 'modem.generic.manufacturer : Sample\nmodem.generic.model : Sample Modem\n'
+		printf 'modem.generic.state : %s\n' "$( [ "$(get data connected)" = connected ] && echo connected || echo registered)"
+		printf 'modem.generic.signal-quality.value : %s\n' "$(get cellsig 68)"
+		printf 'modem.generic.access-technologies.value[1] : %s\n' "$(get celltech lte)"
+		printf 'modem.generic.sim : /org/freedesktop/ModemManager1/SIM/0\nmodem.generic.unlock-required : none\n'
+		printf 'modem.3gpp.operator-name : Sample Mobile\nmodem.3gpp.registration-state : home\n' ;;
+	esac ;;
+upower)
+	case "$*" in
+	-e) echo /org/freedesktop/UPower/devices/battery_BAT0 ;;
+	-i*)
+		printf '  state: %s\n' "$(tr A-Z a-z <"$SYS/power_supply/BAT0/status")"
+		printf '  percentage: %s%%\n  capacity: 92%%\n  time to empty: 5.2 hours\n' "$(cat "$SYS/power_supply/BAT0/capacity")" ;;
+	esac ;;
+gsettings)
+	case "${1:-}" in
+	get) get darkapps "'default'" ;;
+	set) put darkapps "'$4'" ;;
+	esac ;;
+fuser) [ "$(get camuse 0)" = 1 ]; exit ;;
+fprintd-list)
+	# fpdev=no: no sensor; fingers: the enrolled names, one per line
+	[ "$(get fpdev yes)" = yes ] || { echo "No devices available"; exit 1; }
+	printf 'found 1 devices\nDevice at /net/reactivated/Fprint/Device/0\nUsing device /net/reactivated/Fprint/Device/0\n'
+	f=$(cat "$S/fingers" 2>/dev/null)
+	if [ -z "$f" ]; then
+		echo "User ${1:-} has no fingers enrolled for Sample Sensor."
+	else
+		echo "Fingerprints for user ${1:-} on Sample Sensor (press):"
+		printf '%s\n' "$f" | awk '{ printf " - #%d: %s\n", NR - 1, $0 }'
+	fi ;;
+fprintd-verify)
+	# fpnext=match or no-match decides the next scan
+	echo "Using device /net/reactivated/Fprint/Device/0"
+	echo "Listing enrolled fingers:"
+	sleep "$(get fpdelay 1)"
+	r=$(get fpnext match)
+	echo "Verify result: verify-$r (done)"
+	[ "$r" = match ]; exit ;;
+fprintd-enroll)
+	[ "$(get fpdev yes)" = yes ] || exit 1
+	echo "Enrolling right-index-finger finger."
+	for i in 1 2 3; do sleep 0.3; echo "Enroll result: enroll-stage-passed"; done
+	echo "Enroll result: enroll-completed"
+	echo right-index-finger >>"$S/fingers" ;;
+fprintd-delete) rm -f "$S/fingers"; echo "Fingerprints of user ${1:-} deleted on Sample Sensor." ;;
+wf-recorder)
+	# the screen record tile looks for this process by name
+	trap 'exit 0' TERM INT
+	while :; do sleep 3600 & wait $!; done ;;
+gammastep | wlsunset)
+	# the night tile looks for this process by name
+	trap 'exit 0' TERM INT
+	while :; do sleep 3600 & wait $!; done ;;
+sudo | doas | pkexec)
+	echo "$tool: not in the laptop window" >&2
+	exit 1 ;;
+esac
+exit 0

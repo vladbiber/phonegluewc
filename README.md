@@ -1,10 +1,60 @@
-# gluewc
+# phonegluewc
 
-[![build](https://github.com/vladbiber/gluewc/actions/workflows/build.yml/badge.svg)](https://github.com/vladbiber/gluewc/actions/workflows/build.yml)
+[![build](https://github.com/vladbiber/phonegluewc/actions/workflows/build.yml/badge.svg)](https://github.com/vladbiber/phonegluewc/actions/workflows/build.yml)
 [![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![wlroots 0.20](https://img.shields.io/badge/wlroots-0.20-7aa2f7.svg)](https://gitlab.freedesktop.org/wlroots/wlroots/-/releases/0.20.2)
 
-gluewc is a compact, animated Wayland compositor built around automatic BSP
+## Phone
+
+This tree is the phone variant, made for a 1080x2400 OLED at scale 2.75. Every app
+opens full screen on its own workspace. A pill at the bottom edge replaces the
+navigation buttons: drag it up and the overview follows your finger. Drop a window
+onto an occupied workspace in the overview to tile the two.
+
+The shell in `shell/` starts with the compositor. It holds the home screen, the tray
+and the app menu, which is loaded only while it is open. Hold an icon in the tray or the menu to pin
+or unpin it. Pinned apps are listed one per line in `~/.config/phonegluewc/pinned-apps`,
+apps you unpinned in `unpinned-apps` next to it, launch counts in
+`~/.local/state/phonegluewc/app-usage.json`. Hyprland IPC and XWayland are compiled out.
+
+`keyboard/` holds the on-screen keyboard, `phonekbd`. It starts with the compositor and
+shows itself for any app using `text_input_v3`. Suggestions and corrections are offline,
+in Romanian and English; `keyboard/data/SOURCES` has the word list licences. The key next
+to the space bar switches to the laptop layout, with real Ctrl, Alt and Super. Set
+`PHONEGLUEWC_KEYBOARD=` to run without it, or to another keyboard's command.
+
+Hold still on the bar for half a second for screen text: `screentext/phonetext` freezes
+the screen and reads it with tesseract, started just for that. Drag over text to Copy or
+Search, or use Translate all. Tap away or touch the bar to leave. It needs `tesseract`
+with `ron` and `eng` data and `wl-clipboard`; nothing is written to disk, and only Search
+sends anything off the device. `screentext/setup-translation.sh` builds slimt and fetches
+the two Bergamot models once; after that translation runs offline. Without it the rest still works.
+
+The lock screen and the boot login look the same: wallpaper, large clock, one password field,
+a shortcut in each bottom corner and a small session box. No user is named or listed. Lock with
+`qs ipc -p shell call lock lock`. `login.conf` in the config directory sets `user=`, `left=`,
+`right=` and `wallpaper=`. If the shell dies while locked the screen stays locked and a new shell
+brings the field back, five times at most. For now the shortcuts are pictures and open nothing,
+and the session box at the lock is only a label. `PHONEGLUEWC_GREETER=1` starts the boot login.
+Neither real backend (PAM, greetd) has been run yet.
+
+Try it on a laptop with `./run-on-laptop.sh`: a phone shaped window where the mouse is one
+finger and holding F4 makes it four. Add `--lock` or `--login` for the password screens, which
+take a fake password, `test`, and involve no PAM, greetd or real password.
+
+![Home](docs/media/phone/home.png) ![Menu](docs/media/phone/menu-used.png) ![Overview](docs/media/phone/overview.png)
+![Lock](docs/media/phone/lock.png) ![Lock with keyboard](docs/media/phone/lock-keyboard.png) ![Boot login](docs/media/phone/login.png)
+
+Run the headless tests with `sh tests/touch-test.sh`, `bash tests/phone-test.sh`, `bash tests/pin-test.sh`,
+`bash tests/frame-test.sh`, `bash tests/keyboard-test.sh`, `bash tests/lock-test.sh`,
+`bash tests/screentext-test.sh`, `bash tests/statusbar-test.sh`, `bash tests/settings-test.sh`,
+`bash tests/cursor-test.sh`, `bash tests/edge-test.sh`, `bash tests/fit-test.sh`,
+`bash tests/uninstall-test.sh`, `bash tests/button-test.sh`, `bash tests/nav-test.sh`, `bash tests/drag-test.sh`,
+`bash tests/anim-test.sh`, `bash tests/noclose-test.sh`, `bash tests/strip-test.sh`, `bash tests/momentum-test.sh`, `bash tests/kbdhide-test.sh` and `bash tests/laptop-env-test.sh`. `bash tests/realapps-test.sh` tries installed apps.
+Each runs in a sandbox with an empty environment, a private bus and a short list of allowed
+programs, and fails on any compositor crash or core file. `SAN=1` builds with ASan and UBSan.
+
+phonegluewc is a compact, animated Wayland compositor built around automatic BSP
 tiling. It combines a dwl-sized C codebase with workspaces, a GNOME-style
 overview, touchpad gestures, runtime configuration and SceneFX visuals.
 
@@ -66,7 +116,7 @@ One script covers all four cases. It detects the distribution, installs the
 build dependencies and audio, builds a compatible wlroots/SceneFX pair when
 the distribution does not package one, and installs the session entry. It asks
 for administrator privileges for the packages and the system install, and it
-never writes to `~/.config/gluewc/config.conf`.
+never writes to `~/.config/phonegluewc/config.conf`.
 
 **Just the compositor:**
 
@@ -75,7 +125,7 @@ curl -fsSL https://raw.githubusercontent.com/vladbiber/gluewc/main/install.sh | 
 ```
 
 **With the bar** — [glueqs](https://github.com/vladbiber/glueqs), a quickshell
-bar built for gluewc. Installs Quickshell from the distribution, or builds it
+bar built for phonegluewc. Installs Quickshell from the distribution, or builds it
 where there is no package (Chimera, Alpine, openSUSE), adds the tools its
 panels use, clones the bar into `~/.config/quickshell/glueqs` and starts it
 from the session:
@@ -89,7 +139,7 @@ and finishes by listing what the defaults gained that your own config does not
 have. Your config is left alone; you copy across whatever you want:
 
 ```sh
-cd gluewc && ./install.sh --update          # add --with-bar to update that too
+cd phonegluewc && ./install.sh --update          # add --with-bar to update that too
 ./install.sh --check-config                 # only the list, no rebuild
 ```
 
@@ -97,7 +147,7 @@ cd gluewc && ./install.sh --update          # add --with-bar to update that too
 
 ```sh
 git clone https://github.com/vladbiber/gluewc.git
-cd gluewc
+cd phonegluewc
 less install.sh
 ./install.sh          # or: make && sudo make install
 ```
@@ -139,16 +189,16 @@ Permanently, add the flake as an input and enable the module, which registers
 the session and sets up PipeWire, the portals and Xwayland:
 
 ```nix
-imports = [ inputs.gluewc.nixosModules.default ];
-programs.gluewc.enable = true;
-programs.gluewc.bar.enable = true;   # the glueqs bar, with Quickshell from nixpkgs
+imports = [ inputs.phonegluewc.nixosModules.default ];
+programs.phonegluewc.enable = true;
+programs.phonegluewc.bar.enable = true;   # the glueqs bar, with Quickshell from nixpkgs
 ```
 
 ### From source
 
 ```sh
 git clone https://github.com/vladbiber/gluewc.git
-cd gluewc
+cd phonegluewc
 ./install.sh --deps-only     # or install the dependencies yourself
 make
 sudo make install
@@ -157,11 +207,11 @@ sudo make install
 [The installation guide](docs/INSTALL.md) covers `PREFIX`, `DESTDIR`,
 `config.h`, building against a private wlroots and staying up to date.
 
-After installation, log out and select **gluewc** in the display manager. From
+After installation, log out and select **phonegluewc** in the display manager. From
 a TTY, run:
 
 ```sh
-gluewc-session
+phonegluewc-session
 ```
 
 The default bindings expect `alacritty`, `rofi`, `grim` and `slurp` for
@@ -172,7 +222,7 @@ every command can be replaced in the runtime config.
 
 ## First steps
 
-The session wrapper creates `~/.config/gluewc/config.conf` on first login.
+The session wrapper creates `~/.config/phonegluewc/config.conf` on first login.
 Saving it applies it: the file is watched and reloaded on the spot, and
 anything the parser rejects raises a red strip across the top of the screen
 and a notification naming the line. `Super+Shift+R` still reloads by hand.
@@ -204,7 +254,7 @@ and a notification naming the line. `Super+Shift+R` still reloads by hand.
 | `Super+O` | Toggle configured transparency |
 | `Super+Escape` | Enter normal mode; `I` returns to insert mode |
 | `Super+Shift+R` | Reload config in place (it also reloads itself when saved) |
-| `Super+M` or `Super+Shift+Q` | Quit gluewc |
+| `Super+M` or `Super+Shift+Q` | Quit phonegluewc |
 
 Media, volume and backlight sit on the function row, so they work on keyboards
 without media keys or with them behind `Fn`. The media keys themselves keep
@@ -221,7 +271,7 @@ doing the same thing, and in normal mode the same keys need no `Super`.
 
 Playback needs `playerctl`. Volume goes through `wpctl` (part of WirePlumber,
 so it is there on any PipeWire system) and falls back to `pactl`; the backlight
-goes through `gluewc-backlight`, which drives `brightnessctl` (or `light`) in
+goes through `phonegluewc-backlight`, which drives `brightnessctl` (or `light`) in
 5% steps down to 10% and 1% steps below that, so it reaches 0 and turns the
 panel off. Every one of these is a plain `spawn:` line in the config, so they
 can be pointed at anything else.
@@ -240,11 +290,11 @@ workspaces and the overview there.
 
 ## Desktop components
 
-gluewc deliberately does not bundle a bar, launcher or wallpaper daemon.
+phonegluewc deliberately does not bundle a bar, launcher or wallpaper daemon.
 Layer-shell clients reserve their own space, and wallpaper layers are included
 in the overview.
 
-Examples for `~/.config/gluewc/config.conf`:
+Examples for `~/.config/phonegluewc/config.conf`:
 
 ```ini
 autostart = swaybg -i ~/Pictures/wallpaper.jpg -m fill
@@ -253,30 +303,30 @@ autostart = waybar
 
 With no wallpaper program, `root_color = 000000` keeps the background black.
 Waybar can use its `dwl` workspaces module; desktop shells can also consume the
-foreign-toplevel protocol. For shells without a dwl-ipc module gluewc keeps
-`$XDG_STATE_HOME/gluewc/workspaces` up to date (one line per output: name,
-active, workspace, window counts, layout) and installs `gluewc-msg`, which
+foreign-toplevel protocol. For shells without a dwl-ipc module phonegluewc keeps
+`$XDG_STATE_HOME/phonegluewc/workspaces` up to date (one line per output: name,
+active, workspace, window counts, layout) and installs `phonegluewc-msg`, which
 speaks the same protocol from the command line:
 
 ```sh
-gluewc-msg status                        # one line per output
-gluewc-msg outputs                       # geometry, modes, mirror of each monitor
-gluewc-msg -o eDP-1 workspace 3          # view workspace 3 there
-gluewc-msg move 2                        # send the focused window to 2
-gluewc-msg layout scroll
-gluewc-msg -o eDP-1 power off            # switch the panel off (on brings it back)
+phonegluewc-msg status                        # one line per output
+phonegluewc-msg outputs                       # geometry, modes, mirror of each monitor
+phonegluewc-msg -o eDP-1 workspace 3          # view workspace 3 there
+phonegluewc-msg move 2                        # send the focused window to 2
+phonegluewc-msg layout scroll
+phonegluewc-msg -o eDP-1 power off            # switch the panel off (on brings it back)
 ```
 
 ### glueqs
 
 [glueqs](https://github.com/vladbiber/glueqs) is a Quickshell desktop shell
-written alongside gluewc: a dot-matrix bar with workspaces, tray, media,
+written alongside phonegluewc: a dot-matrix bar with workspaces, tray, media,
 network, weather and notifications, plus OSDs, a launcher, the wallpaper (it
 paints it itself, with a picker on `Super+W`) and a dash that appears over the
 overview. It is the shell in the video above. It runs on upstream Quickshell,
 so it works with whatever `quickshell` your distribution packages.
 
-It is entirely optional — gluewc runs with waybar, any other layer-shell bar,
+It is entirely optional — phonegluewc runs with waybar, any other layer-shell bar,
 or none at all — but it is the combination the compositor is developed against:
 
 ```ini
@@ -285,12 +335,12 @@ autostart = qs -c glueqs
 
 ### MacShell and other Hyprland shells
 
-gluewc answers Hyprland's IPC: the request and event sockets under
-`$XDG_RUNTIME_DIR/hypr/gluewc-<display>/`, the `hl.dsp.*` dispatchers, and the
+phonegluewc answers Hyprland's IPC: the request and event sockets under
+`$XDG_RUNTIME_DIR/hypr/phonegluewc-<display>/`, the `hl.dsp.*` dispatchers, and the
 toplevel export and mapping protocols that window previews use. The signature
-is not exported to the session, so programs only take gluewc for Hyprland when
-they are pointed at it; `gluewc-hyprctl` (also installed as `hyprctl` in
-`/usr/lib/gluewc/bin`) is a client for it.
+is not exported to the session, so programs only take phonegluewc for Hyprland when
+they are pointed at it; `phonegluewc-hyprctl` (also installed as `hyprctl` in
+`/usr/lib/phonegluewc/bin`) is a client for it.
 
 [MacShell](https://github.com/0-ss/MacShell), the macOS Tahoe style menu bar,
 Dock and lock screen by Rickky and vSuol, runs on it this way. Glue Linux
@@ -315,11 +365,11 @@ sudo make install
 ```
 
 Compiled defaults remain in `config.def.h`; normal users only need the runtime
-config. Run `man gluewc` for command-line and environment details.
+config. Run `man phonegluewc` for command-line and environment details.
 
 ## License and credits
 
-gluewc is GPL-3.0-or-later. It stands on:
+phonegluewc is GPL-3.0-or-later. It stands on:
 
 - [dwl](https://codeberg.org/dwl/dwl), which grew from the wlroots TinyWL
   example and carries code influenced by [dwm](https://dwm.suckless.org) and

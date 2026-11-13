@@ -7,7 +7,7 @@ curl -fsSL https://raw.githubusercontent.com/vladbiber/gluewc/main/install.sh | 
 ```
 
 The script uses the native package manager, then checks for the exact pkg-config
-modules required by gluewc. Arch, Alpine and Void package wlroots 0.20; on every
+modules required by phonegluewc. Arch, Alpine and Void package wlroots 0.20; on every
 other distribution the installer builds wlroots 0.20.2 from source. No
 distribution packages SceneFX 0.5 yet, so that one is always built from source
 unless `scenefx-0.5` is already installed. Both libraries carry their version in
@@ -22,8 +22,8 @@ Useful modes:
 ./install.sh --dry-run       # show the package command
 ./install.sh --no-deps       # use dependencies already installed
 ./install.sh --no-audio      # skip PipeWire and friends
-./install.sh --deps-only     # prepare dependencies without installing gluewc
-./install.sh --prefix /opt/gluewc
+./install.sh --deps-only     # prepare dependencies without installing phonegluewc
+./install.sh --prefix /opt/phonegluewc
 ./install.sh --uninstall
 ```
 
@@ -32,7 +32,7 @@ Useful modes:
 `--update` pulls the checkout it is run from, hands over to the freshly pulled
 script, rebuilds and installs. `--update --no-deps` skips the package manager
 and goes straight to the rebuild, which is what you want when nothing but
-gluewc itself has changed.
+phonegluewc itself has changed.
 
 Nothing in `~/.config` is rewritten. Instead, every install and update ends
 with a list of the settings and bindings the shipped defaults have that your
@@ -45,7 +45,7 @@ prints that same list on its own.
 ### The bar
 
 `--with-bar` installs [glueqs](https://github.com/vladbiber/glueqs), a
-quickshell bar written for gluewc: it installs Quickshell and the tools the
+quickshell bar written for phonegluewc: it installs Quickshell and the tools the
 bar's panels use (`curl` for the weather, `bluez` and `upower` for the
 Bluetooth and battery panels; NetworkManager is not forced on anyone, the Wi-Fi
 list just stays empty without `nmcli`), enables the Bluetooth daemon, clones
@@ -65,7 +65,7 @@ set up and the script says where to get the binary.
 
 The panels shell out to `bluetoothctl`, `nmcli`, `loginctl`, `udevadm` and
 `curl`; a session bus and D-Bus activation for UPower are all the rest needs,
-and `gluewc-session` provides the bus where there is no systemd user session.
+and `phonegluewc-session` provides the bus where there is no systemd user session.
 
 The default prefix is `/usr/local`; the display-manager entry is installed in
 `/usr/share/wayland-sessions`. Override `SESSIONDIR` when a distribution uses a
@@ -100,7 +100,7 @@ package database sits under `/usr/lib/apk` and there is no
 calls GNU make `gmake` (the installer uses whichever it finds), ships wlroots
 0.20 in its repositories and has `doas` rather than `sudo`; the installer uses
 `sudo`, then `doas`, then `run0`, whichever is there. Its PipeWire is enabled
-through the `pipewire-dinit` user services and `gluewc-session` starts the
+through the `pipewire-dinit` user services and `phonegluewc-session` starts the
 daemons itself where they are not running.
 
 Alongside the compositor the installer adds a terminal and a launcher, because
@@ -121,7 +121,7 @@ Check what would happen without changing anything:
 
 ```sh
 ./install.sh --dry-run
-GLUEWC_DISTRO=fedora ./install.sh --dry-run   # pretend to be another family
+PHONEGLUEWC_DISTRO=fedora ./install.sh --dry-run   # pretend to be another family
 ```
 
 ### Audio
@@ -135,7 +135,7 @@ systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.
 ```
 
 On the distributions without systemd user units — Alpine, Void, Artix, Gentoo
-with OpenRC — nothing needs enabling: `gluewc-session` starts `pipewire`,
+with OpenRC — nothing needs enabling: `phonegluewc-session` starts `pipewire`,
 `wireplumber` and `pipewire-pulse` itself when it finds them and they are not
 already running.
 
@@ -154,7 +154,7 @@ installed and nothing is left behind. Run them from a TTY, not from inside
 another Wayland session, unless you want a nested one:
 
 ```sh
-nix shell github:vladbiber/gluewc nixpkgs#alacritty nixpkgs#rofi -c gluewc-session
+nix shell github:vladbiber/gluewc nixpkgs#alacritty nixpkgs#rofi -c phonegluewc-session
 nix run github:vladbiber/gluewc                        # the compositor, bare
 nix develop github:vladbiber/gluewc                    # a shell where make works
 ```
@@ -173,16 +173,16 @@ up PipeWire, the portals and Xwayland:
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    gluewc.url = "github:vladbiber/gluewc";
+    phonegluewc.url = "github:vladbiber/gluewc";
   };
 
-  outputs = { nixpkgs, gluewc, ... }: {
+  outputs = { nixpkgs, phonegluewc, ... }: {
     nixosConfigurations.mymachine = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
         ./configuration.nix
-        gluewc.nixosModules.default
-        { programs.gluewc.enable = true; }
+        phonegluewc.nixosModules.default
+        { programs.phonegluewc.enable = true; }
       ];
     };
   };
@@ -193,16 +193,16 @@ Module options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `programs.gluewc.enable` | `false` | install gluewc and register its session |
-| `programs.gluewc.package` | this flake's package | swap in your own build |
-| `programs.gluewc.audio` | `true` | PipeWire with the ALSA and PulseAudio bridges |
-| `programs.gluewc.bar.enable` | `false` | the glueqs bar: `glueqs` on PATH (Quickshell from nixpkgs, the QML from this flake's `glueqs` input), `curl`, `bluez`, `upower`, `playerctl`, `brightnessctl`, `grim`, `slurp`, `wl-clipboard`, Bluetooth and UPower on, and `autostart = glueqs` in the config seeded for new accounts |
-| `programs.gluewc.bar.package` | this flake's `glueqs` | swap in your own build of the bar |
+| `programs.phonegluewc.enable` | `false` | install phonegluewc and register its session |
+| `programs.phonegluewc.package` | this flake's package | swap in your own build |
+| `programs.phonegluewc.audio` | `true` | PipeWire with the ALSA and PulseAudio bridges |
+| `programs.phonegluewc.bar.enable` | `false` | the glueqs bar: `glueqs` on PATH (Quickshell from nixpkgs, the QML from this flake's `glueqs` input), `curl`, `bluez`, `upower`, `playerctl`, `brightnessctl`, `grim`, `slurp`, `wl-clipboard`, Bluetooth and UPower on, and `autostart = glueqs` in the config seeded for new accounts |
+| `programs.phonegluewc.bar.package` | this flake's `glueqs` | swap in your own build of the bar |
 
-With `bar.enable`, the default `package` becomes `gluewc-with-bar`, the same
+With `bar.enable`, the default `package` becomes `phonegluewc-with-bar`, the same
 compositor whose shipped `config.def.conf` ends in `autostart = glueqs`, which
-is what `gluewc-session` copies at a user's first login. An account that
-already has `~/.config/gluewc/config.conf` adds that line itself. The bar's
+is what `phonegluewc-session` copies at a user's first login. An account that
+already has `~/.config/phonegluewc/config.conf` adds that line itself. The bar's
 settings are written to `~/.config/glueqs/settings.json`, so the store path
 being read-only does not matter. The `glueqs` input is pinned in `flake.lock`;
 `nix flake update glueqs` moves it to the newest bar. `nix run
@@ -213,8 +213,8 @@ you only want the package and none of the session wiring, skip the module and
 use the overlay instead:
 
 ```nix
-nixpkgs.overlays = [ gluewc.overlays.default ];
-environment.systemPackages = [ pkgs.gluewc ];
+nixpkgs.overlays = [ phonegluewc.overlays.default ];
+environment.systemPackages = [ pkgs.phonegluewc ];
 ```
 
 The flake tracks `nixos-unstable` because it needs `wlroots_0_20` and
@@ -236,7 +236,7 @@ The system flake lives in `/etc/finix`, so all three edits go there. In
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     finix.url = "github:finix-community/finix";
-    gluewc.url = "github:vladbiber/gluewc";
+    phonegluewc.url = "github:vladbiber/gluewc";
   };
 ```
 
@@ -247,7 +247,7 @@ and the rest:
       modules = with finix.nixosModules; [
         { nixpkgs.pkgs = nixpkgs.lib.mkDefault pkgs; }
         (./configuration.nix)
-        inputs.gluewc.nixosModules.default
+        inputs.phonegluewc.nixosModules.default
         # ... the finix modules already listed here
       ];
 ```
@@ -256,8 +256,8 @@ Then in `/etc/finix/configuration.nix`, next to whichever `programs.<wm>.enable`
 is already there:
 
 ```nix
-  programs.gluewc.enable = true;
-  programs.gluewc.bar.enable = true;   # the glueqs bar; drop it for a bare compositor
+  programs.phonegluewc.enable = true;
+  programs.phonegluewc.bar.enable = true;   # the glueqs bar; drop it for a bare compositor
   environment.systemPackages = with pkgs; [ alacritty rofi ];
 ```
 
@@ -265,12 +265,12 @@ The terminal and the launcher are not optional in practice: the compiled
 defaults bind `Super+Q` and `Super+Return` to alacritty and `Super+Space` to
 rofi, and without them you log into a working compositor that shows a black
 screen and opens nothing. Swap them for what you prefer and change the
-bindings in `~/.config/gluewc/config.conf`.
+bindings in `~/.config/phonegluewc/config.conf`.
 
-Rebuild with `sudo finix-rebuild switch` and pick gluewc in tuigreet. The
+Rebuild with `sudo finix-rebuild switch` and pick phonegluewc in tuigreet. The
 session entry travels with the package in `share/wayland-sessions`, which is
 exactly where the greeter looks
-(`/run/current-system/sw/share/wayland-sessions`), and `gluewc-session` starts
+(`/run/current-system/sw/share/wayland-sessions`), and `phonegluewc-session` starts
 the audio daemons itself where there are no user services to enable.
 
 ## Required versions
@@ -327,12 +327,12 @@ and gives you the source tree to hack on.
 
 ```sh
 git clone https://github.com/vladbiber/gluewc.git
-cd gluewc
+cd phonegluewc
 ./install.sh --deps-only
 ```
 
 or install them yourself from the lists above and skip to the next step. Verify
-that the two libraries gluewc links against are visible. `make` searches
+that the two libraries phonegluewc links against are visible. `make` searches
 `$PREFIX/lib/pkgconfig` and `$PREFIX/lib64/pkgconfig` on its own, which is
 where the installer puts the wlroots and SceneFX it builds; bare `pkg-config`
 does not, so name the path when checking by hand:
@@ -350,10 +350,10 @@ make
 The first build copies `config.def.h` to `config.h`. That file holds the
 compile-time defaults — keybindings, colours, autostart — and is yours to edit;
 `make` never overwrites it afterwards. Most settings can also be changed at
-runtime in `~/.config/gluewc/config.conf`, so you rarely need to touch it. After
+runtime in `~/.config/phonegluewc/config.conf`, so you rarely need to touch it. After
 editing it, rebuild with `make` again.
 
-To keep the version string that `gluewc -v` prints, build from a git checkout:
+To keep the version string that `phonegluewc -v` prints, build from a git checkout:
 the Makefile asks `git describe` for it and falls back to `_VERSION` in
 `config.mk` when there is no repository.
 
@@ -364,16 +364,16 @@ sudo make install
 ```
 
 The default prefix is `/usr/local`; the session entry goes to
-`/usr/share/wayland-sessions/gluewc.desktop`. Both are variables:
+`/usr/share/wayland-sessions/phonegluewc.desktop`. Both are variables:
 
 ```sh
-sudo make install PREFIX=/opt/gluewc
+sudo make install PREFIX=/opt/phonegluewc
 sudo make install SESSIONDIR=/usr/local/share/wayland-sessions
 make install DESTDIR=/tmp/stage PREFIX=/usr      # staged, for packaging
 ```
 
-`gluewc-session` finds its default config relative to its own prefix, so a
-custom `PREFIX` needs no further setup; `GLUEWC_DATADIR` overrides the lookup if
+`phonegluewc-session` finds its default config relative to its own prefix, so a
+custom `PREFIX` needs no further setup; `PHONEGLUEWC_DATADIR` overrides the lookup if
 you move the data directory somewhere else.
 
 **4. Check and clean up.**
@@ -384,7 +384,7 @@ make clean      # remove the binary, the objects and the generated protocols
 sudo make uninstall
 ```
 
-`make uninstall` leaves `~/.config/gluewc` alone.
+`make uninstall` leaves `~/.config/phonegluewc` alone.
 
 ### Building against a wlroots that is not installed
 
@@ -402,7 +402,7 @@ make LDFLAGS='-Wl,-rpath,/opt/wlroots/lib'
 ### Keeping a source install up to date
 
 ```sh
-cd gluewc
+cd phonegluewc
 git pull
 make clean && make
 sudo make install
@@ -413,15 +413,15 @@ gains new options upstream, diff the two files and copy over what you want.
 
 ## Starting a session
 
-From a display manager, select **gluewc**. From a configured TTY:
+From a display manager, select **phonegluewc**. From a configured TTY:
 
 ```sh
-gluewc-session
+phonegluewc-session
 ```
 
 The wrapper supplies the Wayland desktop environment, creates a D-Bus session
 when needed, starts available PipeWire components, seeds the default config and
-writes `~/.local/state/gluewc.log`.
+writes `~/.local/state/phonegluewc.log`.
 
 ## Troubleshooting
 
@@ -436,26 +436,26 @@ PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion wlroots-0.20 sc
 Check the installed binary and runtime libraries:
 
 ```sh
-/usr/local/bin/gluewc -v
-ldd /usr/local/bin/gluewc | grep 'not found'
+/usr/local/bin/phonegluewc -v
+ldd /usr/local/bin/phonegluewc | grep 'not found'
 ```
 
-`gluewc -v` prints the version and returns a non-zero status by design. For a
-verbose compositor log, start `gluewc -d` from a TTY. A session launched through
-`gluewc-session` records its normal log at:
+`phonegluewc -v` prints the version and returns a non-zero status by design. For a
+verbose compositor log, start `phonegluewc -d` from a TTY. A session launched through
+`phonegluewc-session` records its normal log at:
 
 ```text
-~/.local/state/gluewc.log
+~/.local/state/phonegluewc.log
 ```
 
 If the session entry is missing, verify that
-`/usr/share/wayland-sessions/gluewc.desktop` exists and restart the display
+`/usr/share/wayland-sessions/phonegluewc.desktop` exists and restart the display
 manager. If the compositor starts but default shortcuts launch nothing, install
 the optional programs listed in the README or replace their `spawn:` actions.
 
 If there is no sound, check that the daemons are actually running inside the
 session — `pgrep -u "$USER" -x pipewire wireplumber` — and look at the tail of
-`~/.local/state/gluewc.log`. On a systemd distribution the units are the usual
+`~/.local/state/phonegluewc.log`. On a systemd distribution the units are the usual
 suspect:
 
 ```sh
