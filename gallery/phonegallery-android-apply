@@ -1,0 +1,15 @@
+#!/bin/sh
+# phonegallery-android-apply: puts what Android may see back as gallery-android.conf says (run at login by the user unit)
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/phonegluewc/gallery-android.conf
+helper=/usr/local/bin/phonegallery-android
+mode=send albums=
+if [ -r "$conf" ]; then
+	while IFS='=' read -r k v; do
+		case $k in mode) mode=$v ;; albums) albums=$v ;; esac
+	done < "$conf"
+fi
+case $mode in
+album) if [ -n "$albums" ]; then IFS=,; set -- $albums; unset IFS; exec sudo -n "$helper" expose-albums "$@"; fi; exec sudo -n "$helper" expose-none ;;
+all) exec sudo -n "$helper" expose-all ;;
+*) exec sudo -n "$helper" expose-none ;;
+esac

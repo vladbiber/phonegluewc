@@ -28,6 +28,8 @@ EOF
 scene() { local n=$1 mode=$2 scale=$3; shift 3
 	mkdir -p "$W/cfg/phonegluewc" "$W/$n"
 	printf 'remember_layout = false\noutput = * mode=%s scale=%s\n' "$mode" "$scale" >"$W/cfg/phonegluewc/config.conf"
+	# the charger animation would cover the pill being measured
+	echo "dyn_charging=off" >"$W/cfg/phonegluewc/phone.conf"
 	{ echo "w 3000"
 	for l in $LEVELS; do for c in Discharging Charging; do
 		echo "x sh $W/l.sh $l $c"; echo "d 0 0.5 0.01"; echo f; echo "u 0"; echo f; echo "w 1400"

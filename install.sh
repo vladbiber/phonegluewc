@@ -663,7 +663,7 @@ session_packages() {
 	fedora) printf 'grim slurp wl-clipboard playerctl brightnessctl xdg-desktop-portal xdg-desktop-portal-wlr' ;;
 	suse)   printf 'grim slurp wl-clipboard playerctl brightnessctl xdg-desktop-portal xdg-desktop-portal-wlr' ;;
 	gentoo) printf 'gui-apps/grim gui-apps/slurp gui-apps/wl-clipboard media-sound/playerctl dev-libs/light sys-apps/xdg-desktop-portal gui-libs/xdg-desktop-portal-wlr gui-apps/xwayland-satellite' ;;
-	alpine) printf 'grim slurp wl-clipboard playerctl brightnessctl xdg-desktop-portal xdg-desktop-portal-wlr xwayland-satellite' ;;
+	alpine) printf 'grim slurp wl-clipboard playerctl brightnessctl xdg-desktop-portal xdg-desktop-portal-wlr xwayland-satellite lomiri-sounds' ;;
 	chimera) printf 'grim slurp wl-clipboard playerctl brightnessctl xdg-desktop-portal xdg-desktop-portal-wlr' ;;
 	void)   printf 'grim slurp wl-clipboard playerctl brightnessctl xdg-desktop-portal xdg-desktop-portal-wlr' ;;
 	esac

@@ -148,12 +148,12 @@ def exif_segment(exp_us, iso, t, model="Nothing Phone (1)"):
     return b"\xff\xe1" + struct.pack(">H", len(body) + 2) + body
 
 
-def add_exif(path, exp_us, iso, t):
+def add_exif(path, exp_us, iso, t, model="Nothing Phone (1)"):
     with open(path, "rb") as f:
         jpg = f.read()
     if jpg[:2] == b"\xff\xd8":
         with open(path, "wb") as f:
-            f.write(jpg[:2] + exif_segment(exp_us, iso, t) + jpg[2:])
+            f.write(jpg[:2] + exif_segment(exp_us, iso, t, model) + jpg[2:])
 
 
 def _inv3(m):
@@ -177,20 +177,23 @@ def color_matrix(ccm):
 
 
 def write_dng(path, w, h, pixels, black, white, wb, ccm, rot=0, cfa=(1, 0, 2, 1), exp_us=0, iso=0, t=None,
-              model="Nothing Phone (1) S5KJN1"):
+              model="Nothing Phone (1) S5KJN1", anon=False):
     """uncompressed 16-bit Bayer DNG. pixels: h*w uint16 little endian (bytes-like), cfa: colour
     of the 2x2 tile (0 R, 1 G, 2 B), wb: (R gain, B gain) as shot, rot: clockwise degrees to upright."""
     t = time.time() if t is None else t
     tags = [
         (254, 4, [0]), (256, 4, [w]), (257, 4, [h]), (258, 3, [16]), (259, 3, [1]), (262, 3, [32803]),
-        (271, 2, "Nothing"), (272, 2, model), (274, 3, [{0: 1, 90: 6, 180: 3, 270: 8}[rot]]), (277, 3, [1]),
-        (278, 4, [h]), (279, 4, [w * h * 2]), (284, 3, [1]), (305, 2, "phonecam"),
-        (306, 2, time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(t))),
+        (274, 3, [{0: 1, 90: 6, 180: 3, 270: 8}[rot]]), (277, 3, [1]),
+        (278, 4, [h]), (279, 4, [w * h * 2]), (284, 3, [1]),
         (33421, 3, [2, 2]), (33422, 1, list(cfa)), (50706, 1, [1, 4, 0, 0]), (50707, 1, [1, 1, 0, 0]),
-        (50708, 2, model), (50711, 3, [1]), (50714, 4, [black]), (50717, 4, [white]),
+        (50711, 3, [1]), (50714, 4, [black]), (50717, 4, [white]),
         (50721, 10, color_matrix(ccm)), (50728, 5, [1 / wb[0], 1, 1 / wb[1]]), (50778, 3, [21]),
     ]
-    if exp_us:
+    # who and when: left out of an anonymous file; readers only need DNGVersion and a model name, so that is a plain word
+    tags += [(50708, 2, "Camera")] if anon else [
+        (271, 2, "Nothing"), (272, 2, model), (305, 2, "phonecam"),
+        (306, 2, time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(t))), (50708, 2, model)]
+    if exp_us and not anon:
         tags += [(t_, ty, v) for t_, ty, v in _exif_tags(exp_us, iso, t) if t_ in (33434, 34855)]
     at = 8 + len(_ifd(tags + [(273, 4, [0])], 8))
     with open(path, "wb") as f:
@@ -198,8 +201,125 @@ def write_dng(path, w, h, pixels, black, white, wb, ccm, rot=0, cfa=(1, 0, 2, 1)
         f.write(pixels)
 
 
+def strip_mp4(path):
+    """no creation or modification time and no user-data box (tags, encoder name) in an MP4; the file keeps its size,
+    so every offset stays valid. Returns how many fields were cleared."""
+    n = 0
+    with open(path, "r+b") as f:
+        def walk(start, end):
+            nonlocal n
+            pos = start
+            while pos + 8 <= end:
+                f.seek(pos)
+                size, kind = struct.unpack(">I4s", f.read(8))
+                hdr = 8
+                if size == 1:
+                    size = struct.unpack(">Q", f.read(8))[0]
+                    hdr = 16
+                elif size == 0:
+                    size = end - pos
+                if size < hdr or pos + size > end:
+                    break
+                if kind in (b"moov", b"trak", b"mdia"):
+                    walk(pos + hdr, pos + size)
+                elif kind in (b"mvhd", b"tkhd", b"mdhd"):
+                    ver = f.read(1)[0]
+                    f.seek(pos + hdr + 4)
+                    f.write(bytes(16 if ver else 8))
+                    n += 1
+                elif kind == b"udta":
+                    f.seek(pos + 4)
+                    f.write(b"free" + bytes(size - hdr))
+                    n += 1
+                pos += size
+        f.seek(0, 2)
+        walk(0, f.tell())
+        # x264 writes its version and settings into the first frame as an SEI note: blank the note and its
+        # encoder id in place (filler that cannot look like a start code), the stream stays valid
+        f.seek(0)
+        head = f.read(4 << 20)
+        at = head.find(X264_UUID)
+        if at >= 0:
+            end = head.find(b"\0", at + 16)
+            end = end if end > 0 else at + 16
+            f.seek(at)
+            f.write(b"\x11" * 16 + b" " * (end - at - 16))
+            n += 1
+    return n
+
+
+X264_UUID = bytes.fromhex("dc45e9bde6d948b7962cd820d923eeef")
+
+
+QR_HOST_MAX = 28  # a longer host is shown cut, so the full address is read before it is opened
+
+
+def wifi_fields(text):
+    """the fields of a WIFI:T:WPA;S:name;P:pass;; code; backslash escapes ; , : " and itself"""
+    out, key, cur, esc, i = {}, None, "", False, 5
+    while i < len(text):
+        c = text[i]
+        i += 1
+        if esc:
+            cur, esc = cur + c, False
+        elif c == "\\":
+            esc = True
+        elif key is None and c == ":":
+            key, cur = cur, ""
+        elif key is not None and c == ";":
+            out[key], key, cur = cur, None, ""
+        elif key is None and c == ";":
+            cur = ""
+        else:
+            cur += c
+    if key is not None:
+        out[key] = cur
+    return out
+
+
+def qr_describe(text):
+    """what a decoded QR code is: dict(kind url|wifi|contact|text, label for the pill, text as read,
+    and for a url: confirm (show the whole address first), for wifi: ssid, password, open)"""
+    from urllib.parse import urlsplit
+    t = text.strip()
+    low = t.lower()
+    if low.startswith(("http://", "https://")) and not any(c.isspace() for c in t):
+        try:
+            u = urlsplit(t)
+            host = (u.hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host:
+            cut = len(host) > QR_HOST_MAX
+            shown = host[:QR_HOST_MAX - 1] + "\u2026" if cut else host
+            odd = "@" in u.netloc or host.startswith("xn--") or ".xn--" in host
+            return dict(kind="url", label=shown, text=t, confirm=cut or odd)
+    if low.startswith("wifi:"):
+        f = wifi_fields(t)
+        ssid = f.get("S", "")
+        if ssid:
+            kind = f.get("T", "").upper()
+            return dict(kind="wifi", label="Wi-Fi: " + ssid, text=t, ssid=ssid, password=f.get("P", ""),
+                        open=kind in ("", "NOPASS") or not f.get("P"), hidden=f.get("H", "").lower() == "true")
+    if low.startswith(("begin:vcard", "mecard:")):
+        return dict(kind="contact", label="Contact", text=t)
+    return dict(kind="text", label="Text", text=t)
+
+
 def selfcheck():
     import os
+    import struct as st
+    import tempfile as tf
+    box = lambda k, b: st.pack(">I4s", 8 + len(b), k) + b
+    mv = box(b"mvhd", b"\0\0\0\0" + st.pack(">II", 12345, 67890) + bytes(80))
+    sei = X264_UUID + b"x264 - core 164 - H.264/MPEG-4 AVC codec options: cabac=0\0\x80"
+    mp4 = box(b"ftyp", b"mp42\0\0\0\0") + box(b"mdat", b"\0\0\0\x40\x06\x05\x40" + sei) + box(b"moov", mv + box(b"udta", b"Lavf-secret"))
+    with tf.NamedTemporaryFile(delete=False) as t:
+        t.write(mp4)
+    assert strip_mp4(t.name) == 3
+    out = open(t.name, "rb").read()
+    assert len(out) == len(mp4) and b"Lavf" not in out and b"x264" not in out and X264_UUID not in out and st.pack(">I", 12345) not in out
+    os.unlink(t.name)
     import tempfile
     # the calibrated lights come back exactly; warmer light needs more blue, less red
     for k, r, b in WB_CAL:
@@ -253,6 +373,17 @@ def selfcheck():
     assert abs(m[0] * rg - 3.2406) < 2e-3 and abs(m[8] * bg - 1.0570) < 2e-3, m
     seg = exif_segment(20000, 800, 0)
     assert seg[:2] == b"\xff\xe1" and struct.unpack(">H", seg[2:4])[0] == len(seg) - 2 and b"1970:01:01" in seg
+    q = qr_describe("https://example.com/a?b=1")
+    assert (q["kind"], q["label"], q["confirm"]) == ("url", "example.com", False)
+    q = qr_describe("https://" + "a" * 40 + ".com/x")
+    assert q["confirm"] and q["label"].endswith("\u2026") and len(q["label"]) == QR_HOST_MAX
+    assert qr_describe("https://good.com@evil.test/")["confirm"] and qr_describe("http://xn--e1afmkfd.test")["confirm"]
+    q = qr_describe("WIFI:T:WPA;S:Home\\;Net;P:pa\\:ss;H:false;;")
+    assert (q["kind"], q["ssid"], q["password"], q["open"]) == ("wifi", "Home;Net", "pa:ss", False), q
+    assert qr_describe("WIFI:T:nopass;S:Cafe;;")["open"] and qr_describe("WIFI:S:;P:x;;")["kind"] == "text"
+    assert qr_describe("BEGIN:VCARD\nFN:A")["label"] == "Contact" and qr_describe("MECARD:N:A;;")["kind"] == "contact"
+    assert qr_describe("hello world")["label"] == "Text" and qr_describe("https://a b.com")["kind"] == "text"
+    assert qr_describe("javascript:alert(1)")["kind"] == "text" and qr_describe("mailto:a@b.c")["kind"] == "text"
 
 
 if __name__ == "__main__":

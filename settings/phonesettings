@@ -5,8 +5,8 @@ d=$(dirname "$(readlink -f "$0")")
 # language was this page's old name
 [ "${1:-}" = language ] && set -- keyboard
 case ${1:-} in
-"" | wifi | bluetooth | display | sound | mobile | battery | look | apps | keyboard | languages | about | security | camera) ;;
-*) printf 'usage: phonesettings [wifi|bluetooth|display|sound|mobile|battery|look|apps|keyboard|languages|about|security|camera]\n' >&2; exit 2 ;;
+"" | wifi | bluetooth | display | sound | mobile | battery | look | apps | keyboard | languages | about | security | camera | waydroid) ;;
+*) printf 'usage: phonesettings [wifi|bluetooth|display|sound|mobile|battery|look|apps|keyboard|languages|about|security|camera|waydroid]\n' >&2; exit 2 ;;
 esac
 qs ipc -p "$d" call settings open "${1:-}" >/dev/null 2>&1 && exit 0
 PHONESETTINGS_PAGE=${1:-} exec qs -p "$d"

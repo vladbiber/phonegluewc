@@ -18,7 +18,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gst", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Gtk, Gst, GLib, Gio, Gdk, GdkPixbuf, Graphene
+from gi.repository import Gtk, Gst, GLib, Gio, Gdk, GdkPixbuf, Graphene, Pango
 
 Gst.init(None)
 cv2.setNumThreads(2)
@@ -54,6 +54,10 @@ VIDEO = {"720P": (1280, 720, 10000), "1080P": (1920, 1080, 20000), "1440P": (256
 LOOKS = {"STANDARD": (1.0, 1.0), "FLAT": (0.7, 0.8), "VIVID": (1.1, 1.3), "MONO": (1.05, 0.0)}
 VIEW_MAX_US = 98000  # longest exposure the viewfinder takes
 IDLE_S = 180  # an untouched viewfinder lets go of the sensor
+QR_EVERY = 0.35  # seconds between scans of the viewfinder
+QR_WIDTH = 800  # the scanned frame is this wide
+QR_GONE = 1.5  # the pill stays this long after the code left the frame
+QR_DRY = os.environ.get("PHONECAM_QR_DRY")  # test hook: actions are written to this file instead of run
 RED = (0.843, 0.098, 0.129)
 
 
@@ -91,7 +95,7 @@ PICS = os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTU
                     or os.path.expanduser("~/Pictures"), "Camera")
 VIDS = PICS  # one camera roll: the gallery shows a single folder
 CONF = os.path.join(GLib.get_user_config_dir(), "phonecam.json")
-DEFAULTS = dict(mode="photo", size=0, aspect="4:3", stack=True, dng=False, timer=0, filter=0, flash="OFF",
+DEFAULTS = dict(qr=True, mode="photo", size=0, aspect="4:3", stack="AUTO", dng=False, anon=False, timer=0, filter=0, flash="OFF",
                 grid=False, level=False, hist=True, zebra=0, peaking=False, falsecolor=False,
                 vres="1080P", fps=30, look="STANDARD", lock=False, vguide="OFF",
                 shutter=None, angle=None, iso=None, ev=0.0, wb=None, tint=0, focus=None)
@@ -100,14 +104,17 @@ ONOFF = [("OFF", False), ("ON", True)]
 ROWS = [
     ("size", "RESOLUTION", "", [(m[0], i) for i, m in enumerate(CAMERAS[0][4])], "photo pro"),
     ("aspect", "ASPECT", "1.43 and 1.90 are the IMAX frames", [(n, n) for n, _ in lib.ASPECTS], "photo pro"),
-    ("stack", "MULTI-FRAME", "On: hold still, several frames merge against noise. Off: one instant frame", ONOFF, "photo pro"),
+    ("stack", "CAPTURE", "Instant: one frame, no waiting. Stacked: hold still, frames merge against noise. Auto: stacks only in low light", [("INSTANT", "INSTANT"), ("AUTO", "AUTO"), ("STACKED", "STACKED")], "photo pro"),
     ("dng", "RAW", "Keeps a DNG next to the JPEG", [("OFF", False), ("DNG", True)], "photo pro"),
+    ("anon", "ANONYMOUS", "Photos, RAW and videos are saved without camera, time, place or software details and with a random file name",
+     ONOFF, "photo video pro"),
     ("timer", "TIMER", "", [("OFF", 0), ("3 S", 3), ("10 S", 10)], "photo pro"),
     ("filter", "FILTER", "", [(n.upper(), i) for i, (n, _) in enumerate(FILTERS)], "photo pro"),
     ("vres", "RESOLUTION", "H.264 in MP4", [(k, k) for k in VIDEO], "video"),
     ("look", "LOOK", "Flat keeps more room for grading", [(k, k) for k in LOOKS], "video"),
     ("vguide", "FRAME GUIDE", "Lines only, the full frame is recorded", [("OFF", "OFF")] + [(n, n) for n, _ in lib.ASPECTS[2:]], "video"),
     ("lock", "LOCK IN REC", "Shutter, ISO and white balance stay put while recording", ONOFF, "video"),
+    ("qr", "QR CODES", "A code in view shows a pill; nothing opens until you tap it", ONOFF, "photo"),
     ("flash", "LIGHT", "", [("OFF", "OFF"), ("FLASH", "FLASH"), ("TORCH", "TORCH")], "photo video pro"),
     ("grid", "GRID", "", ONOFF, "photo video pro"),
     ("level", "LEVEL", "", ONOFF, "photo video pro"),
@@ -180,6 +187,11 @@ button { background: none; border: none; box-shadow: none; outline: none; color:
 .seg:last-child { border-radius: 0 17px 17px 0; }
 .seg:only-child { border-radius: 17px; }
 .seg.on { background: white; color: black; }
+.qrpill { min-height: 40px; padding: 0 18px; border-radius: 20px; background: white; color: black; font-size: 14px; font-weight: bold; }
+.qrcard { background: #111111; border-radius: 24px; padding: 18px; margin: 0 20px; }
+.qrbody { font-size: 14px; color: white; }
+.qrbtn { min-height: 38px; padding: 0 16px; border-radius: 19px; background: #1c1c1c; font-size: 12px; font-weight: bold; }
+.qrbtn.main { background: white; color: black; }
 .close { min-height: 40px; border-radius: 20px; background: #1c1c1c; font-size: 11px; font-weight: bold; letter-spacing: 1.5px; }
 """
 
@@ -423,8 +435,11 @@ class Cam(Gtk.ApplicationWindow):
                     self.S[key] = DEFAULTS[key]
         except (OSError, ValueError):
             pass
+        if os.environ.get("PHONECAM_DEBUG"):  # test hook: USR2 presses the shutter
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, lambda: (self.shutter_clicked(), True)[1])
         self.idx, self.pipe, self.tap, self.src, self.last = 0, None, None, None, None
         self.busy = False  # raw frames being grabbed
+        self.queued = False  # a shutter press that came while the sensor was busy: the next shot starts by itself
         self.jobs = queue.Queue()  # raw files waiting to be developed, one worker
         self.pending, self.progress, self.closing = 0, 0.0, False
         self.meter = None  # tapped point in sensor coordinates: metering for the next shot, focus area
@@ -449,6 +464,9 @@ class Cam(Gtk.ApplicationWindow):
         self.tap_lock = threading.Lock()
         self.fresh, self.starts = None, 0
         self.frame = None
+        self.qr_in, self.qr_ev, self.qr_last = None, threading.Event(), 0.0
+        self.qrimg = os.environ.get("PHONECAM_QRIMG")
+        self.qr_info, self.qr_seen, self.qr_text = None, 0.0, None
 
         self.finder = Finder()
         self.finder.inset = 88
@@ -479,7 +497,12 @@ class Cam(Gtk.ApplicationWindow):
                                      margin_start=12, margin_top=92, can_target=False)
         self.scope.set_draw_func(self.draw_scope)
         view = Gtk.Overlay(child=self.finder, hexpand=True, vexpand=True)
-        for wdg in (self.scope, top, self.msg):
+        self.qrpill = button(css_classes=["qrpill"], halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=22,
+                             visible=False, name_="QR code")
+        self.qrpill.connect("clicked", self.qr_tapped)
+        self.qrcard = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["qrcard"],
+                              halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, visible=False)
+        for wdg in (self.scope, top, self.msg, self.qrpill, self.qrcard):
             view.add_overlay(wdg)
 
         # panel: adjust ruler, value tiles, zoom, modes, shutter row
@@ -557,10 +580,12 @@ class Cam(Gtk.ApplicationWindow):
         self.connect("realize", lambda *_: self.get_surface().connect("layout", self.on_layout))
         threading.Thread(target=self.developer, daemon=True).start()
         threading.Thread(target=self.analyse, daemon=True).start()
+        threading.Thread(target=self.qr_worker, daemon=True).start()
         threading.Thread(target=self.poll_sensor, daemon=True).start()
         if shutil.which("ssccli") and not TESTSRC:
             threading.Thread(target=self.gravity, daemon=True).start()
         GLib.timeout_add(1000, self.tick)
+        GLib.timeout_add(300, self.qr_tick)
         self.set_zoom(1)
         self.set_mode(self.S["mode"], first=True)
         GLib.timeout_add(1500, self.script, os.environ.get("PHONECAM_DO", "").split())
@@ -577,6 +602,16 @@ class Cam(Gtk.ApplicationWindow):
             wait = int(float(step) * 1000)
         elif name == "set":
             self.set_option(key, {str(v).lower(): v for r in ROWS if r[0] == key for _l, v in r[3]}[val.lower()])
+        elif name == "qrimg":  # qrimg:/path.png changes the test picture ("qrimg:" back to the test pattern)
+            self.qrimg = arg or None
+            self.start()
+        elif name == "qrpill":  # taps the pill
+            self.qr_tapped()
+        elif name == "qrbtn":  # qrbtn:OPEN presses a button of the card
+            b = self.qrcard.get_last_child().get_first_child()
+            while b and b.get_name() != arg:
+                b = b.get_next_sibling()
+            b and b.emit("clicked")
         elif name == "param":  # param:iso=4 sets a tile's value, param:iso returns it to automatic
             self.select(key)
             if val:
@@ -807,7 +842,7 @@ class Cam(Gtk.ApplicationWindow):
             text = f"{S['vres']} | {self.fps} FPS | {S['look']}"
         else:
             modes = self.cam[4]
-            text = f"{modes[min(S['size'], len(modes) - 1)][0]} | {S['aspect']}" + (" | STACK" if S["stack"] else "") \
+            text = f"{modes[min(S['size'], len(modes) - 1)][0]} | {S['aspect']}" + (" | " + S["stack"] if S["stack"] != "AUTO" else "") \
                 + (" | RAW" if S["dng"] else "") + (f" | {S['timer']}S" if S["timer"] else "")
         self.status.set(text, (1, 1, 1))
 
@@ -1060,7 +1095,10 @@ class Cam(Gtk.ApplicationWindow):
         name, path, _rot, _mirror, _modes = self.cam
         video = self.S["mode"] == "video"
         w, h, kbit = VIDEO[self.S["vres"]] if video else (2048, 1536, 0)
-        if TESTSRC:
+        if TESTSRC and self.qrimg:  # test hook: a PNG (a QR code on grey) as the camera picture
+            src = (f'filesrc location="{self.qrimg}" ! decodebin ! imagefreeze is-live=true ! videoconvertscale'
+                   f" ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1")
+        elif TESTSRC:
             src = f"videotestsrc is-live=true pattern=smpte ! video/x-raw,format=RGBA,width={w},height={h},framerate=30/1"
         else:
             src = f'libcamerasrc name=src camera-name="{path}" ! video/x-raw,width={w},height={h}'
@@ -1077,7 +1115,7 @@ class Cam(Gtk.ApplicationWindow):
             turn = (self.cam[2] - self.theta if name == "back" else self.cam[2] + self.theta) % 360
             desc += (f" t. ! queue name=recq leaky=downstream max-size-buffers=8 ! videoconvert n-threads=4"
                      f" ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast bitrate={kbit} key-int-max=30 threads=6"
-                     f" ! h264parse ! taginject tags=\"image-orientation=(string)rotate-{turn}\""
+                     + f" ! h264parse ! taginject tags=\"image-orientation=(string)rotate-{turn}\""
                      f" ! queue ! mux. mp4mux name=mux ! filesink location=\"{record}\"")
             if mic:
                 desc += (f" pulsesrc device={mic} ! audioconvert ! audioresample ! level name=level interval=100000000"
@@ -1095,6 +1133,8 @@ class Cam(Gtk.ApplicationWindow):
         if record:
             self.pipe.get_by_name("recq").connect("overrun", self.on_drop)
         pt = self.pipe.get_by_name("sink").props.paintable
+        if os.environ.get("PHONECAM_DEBUG"):  # test hook: frames drawn per second, printed by tick()
+            pt.connect("invalidate-contents", lambda *_: setattr(self, "drawn", getattr(self, "drawn", 0) + 1))
         # the still frame put up by stop() stays until the first new frame (a new size comes as its own signal).
         # Nothing here may keep the paintable alive past its pipeline, see still().
         self.fresh = (pt, [pt.connect(sig, self.first_frame) for sig in ("invalidate-contents", "invalidate-size")])
@@ -1304,11 +1344,152 @@ class Cam(Gtk.ApplicationWindow):
             arr = np.frombuffer(data, np.uint8)[:h * (len(data) // h)].reshape(h, len(data) // h)[:, :w * 4].reshape(h, w, 4)
             if fmt.startswith("BGR"):
                 arr = arr[:, :, [2, 1, 0, 3]]
+            if now - self.qr_last >= QR_EVERY and self.qr_wanted():
+                self.qr_last = now
+                small = cv2.resize(arr, (QR_WIDTH, QR_WIDTH * h // w), interpolation=cv2.INTER_AREA)
+                gray = cv2.cvtColor(small, cv2.COLOR_RGBA2GRAY)  # R and B only swap weights, which is fine for a code
+                self.qr_in = cv2.flip(gray, 1) if self.cam[3] else gray  # the front camera's preview is mirrored
+                self.qr_ev.set()
             if self.lens_ok():
                 self.focus_step(arr, now)
             if now - last >= every:
                 last, n = now, n + 1
                 GLib.idle_add(self.assist, *self.tools(arr, n))
+
+    # ---- QR codes: scanned off the UI thread on a small grey copy, shown as a pill, acted on only by a tap
+
+    def qr_wanted(self):
+        return bool(self.S["qr"] and self.S["mode"] == "photo" and self.tap and not (self.busy or self.rec or self.asleep
+                    or self.paused or self.closing or self.count_id))
+
+    def qr_worker(self):
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)  # the viewfinder and the shutter come first
+        except OSError:
+            pass
+        det = cv2.QRCodeDetector()
+        while not self.quit:
+            self.qr_ev.wait()
+            self.qr_ev.clear()
+            gray, self.qr_in = self.qr_in, None
+            if gray is None or not self.qr_wanted():
+                continue
+            try:
+                text = det.detectAndDecode(gray)[0]
+            except cv2.error:
+                text = ""
+            if text:
+                GLib.idle_add(self.qr_found, text)
+
+    def qr_found(self, text):
+        self.qr_seen = time.monotonic()
+        if self.qr_card_open() or not self.qr_wanted():
+            return False
+        if text != self.qr_text:
+            self.qr_text, self.qr_info = text, lib.qr_describe(text)
+            self.qrpill.set_child(Gtk.Label(label=self.qr_info["label"], ellipsize=Pango.EllipsizeMode.END, max_width_chars=30))
+        self.qrpill.set_visible(True)
+        return False
+
+    def qr_tick(self):
+        """the pill goes a moment after the code left the frame, or when scanning no longer applies"""
+        if self.qrpill.get_visible() and (not self.qr_wanted() or time.monotonic() - self.qr_seen > QR_GONE):
+            self.qrpill.set_visible(False)
+            self.qr_text = None
+        return not self.quit
+
+    def qr_card_open(self):
+        return self.qrcard.get_visible()
+
+    def qr_close(self, *_):
+        self.qrcard.set_visible(False)
+        self.qr_text = None
+        self.qrpill.set_visible(False)
+
+    def qr_card(self, title, body, buttons):
+        c = self.qrcard.get_first_child()
+        while c:
+            nxt = c.get_next_sibling()
+            self.qrcard.remove(c)
+            c = nxt
+        self.qrcard.append(Gtk.Label(label=title, css_classes=["rtitle"], xalign=0))
+        self.qrcard.append(Gtk.Label(label=body, css_classes=["qrbody"], xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR,
+                                     max_width_chars=32, selectable=False))
+        buttons = buttons + [("CLOSE", self.qr_close, False)]
+        tall = any(len(b[0]) > 8 for b in buttons)  # long labels stack instead of running off the screen
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL if tall else Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
+        for label, fn, main in buttons:
+            b = Gtk.Button(label=label, css_classes=["qrbtn", "main"] if main else ["qrbtn"], name=label)
+            b.connect("clicked", lambda _b, fn=fn: fn())
+            row.append(b)
+        self.qrcard.append(row)
+        self.qrpill.set_visible(False)
+        self.qrcard.set_visible(True)
+
+    def qr_tapped(self, *_):
+        q = self.qr_info
+        if not q:
+            return
+        if q["kind"] == "url":
+            if q["confirm"]:  # the pill cut the host or it looks like a disguise: the whole address first
+                self.qr_card("OPEN THIS LINK?", q["text"], [("OPEN", lambda: self.qr_open(q["text"]), True),
+                                                           ("COPY", lambda: self.qr_copy(q["text"]), False)])
+            else:
+                self.qr_open(q["text"])
+        elif q["kind"] == "wifi":
+            pw = "" if q["open"] else q["password"]
+            body = q["ssid"] + ("\nNo password" if q["open"] else "\nPassword: " + pw)
+            btns = [("JOIN", lambda: self.qr_join(q), True)]
+            if pw:
+                btns.append(("COPY PASSWORD", lambda: self.qr_copy(pw), False))
+            self.qr_card("WI-FI NETWORK", body, btns)
+        else:
+            self.qr_card(q["label"].upper(), q["text"], [("COPY", lambda: self.qr_copy(q["text"]), True)])
+
+    def qr_log(self, line):
+        if QR_DRY:
+            with open(QR_DRY, "a") as f:
+                f.write(line + "\n")
+        return bool(QR_DRY)
+
+    def qr_open(self, url):
+        self.qr_close()
+        if not self.qr_log("open " + url):
+            subprocess.Popen(["xdg-open", url], start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def qr_copy(self, text):
+        self.qr_close()
+        if not self.qr_log("copy " + text):
+            try:
+                p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                p.stdin.write(text.encode())
+                p.stdin.close()
+                self.show_msg("Copied")
+            except OSError:
+                self.show_msg("Could not copy")
+            GLib.timeout_add(1200, lambda: self.show_msg("") and False)
+
+    def qr_join(self, q):
+        self.qr_close()
+        if self.qr_log("join " + q["ssid"] + " " + ("open" if q["open"] else "secret")):
+            return
+        if q["ssid"].startswith("-") or not shutil.which("nmcli"):
+            return self.show_msg("Could not join\n" + ("Unusable network name" if shutil.which("nmcli") else "NetworkManager is missing"))
+        self.show_msg("Joining " + q["ssid"] + "...")
+
+        def run():
+            cmd = ["nmcli", "-w", "30"] + ([] if q["open"] else ["--ask"]) + ["dev", "wifi", "connect", q["ssid"]]
+            if q["hidden"]:
+                cmd += ["hidden", "yes"]
+            try:
+                r = subprocess.run(cmd, input=None if q["open"] else q["password"] + "\n", capture_output=True, text=True, timeout=40)
+                ok, why = r.returncode == 0, (r.stderr.strip().splitlines() or ["The network did not accept the connection."])[0]
+            except (OSError, subprocess.TimeoutExpired):
+                ok, why = False, "Timed out"
+            GLib.idle_add(lambda: (self.show_msg("Joined " + q["ssid"] if ok else "Could not join\n" + why),
+                                   GLib.timeout_add(2500, lambda: self.show_msg("") and False), False)[2])
+        threading.Thread(target=run, daemon=True).start()
 
     def sharpness(self, arr):
         """edge energy around the focus point, scaled by brightness so exposure changes do not read as blur"""
@@ -1444,6 +1625,9 @@ class Cam(Gtk.ApplicationWindow):
 
     def tick(self):
         """once a second: recording clock, idle release of the sensor"""
+        if os.environ.get("PHONECAM_DEBUG"):
+            print("fps", getattr(self, "drawn", 0), "qr", self.qr_wanted(), file=sys.stderr, flush=True)
+            self.drawn = 0
         if self.rec:
             self.update_status()
         elif self.pipe and not self.busy and not self.count_id and time.monotonic() - self.touched > IDLE_S:
@@ -1485,7 +1669,7 @@ class Cam(Gtk.ApplicationWindow):
         os.makedirs(VIDS, exist_ok=True)
         if shutil.disk_usage(VIDS).free < 200e6:
             return self.shot_failed("Storage full")
-        path = os.path.join(VIDS, time.strftime("VID_%Y%m%d_%H%M%S.mp4"))
+        path = output_name(time.time(), self.S["anon"], "VID", "mp4")
         self.sheet_open(False)
         if self.S["lock"] and not self.locked and not TESTSRC:
             self.show_msg("Locking exposure")
@@ -1536,6 +1720,8 @@ class Cam(Gtk.ApplicationWindow):
         rec, self.rec, self.locked = self.rec, None, None
         if not rec:
             return
+        if self.S["anon"] and os.path.exists(rec["path"]):
+            lib.strip_mp4(rec["path"])
         snap = self.still()
         self.shutter.set_sensitive(True)
         self.record_ui(False)
@@ -1569,13 +1755,26 @@ class Cam(Gtk.ApplicationWindow):
             GLib.source_remove(self.count_id)
             self.count_id = self.finder.count = 0
             return self.finder.queue_draw()
-        if self.busy or not self.pipe or self.pending >= 3:
+        if self.pending >= 3 or self.S["timer"] and (self.busy or not self.pipe):
+            return
+        if self.busy or not self.pipe:  # pressed while the sensor is busy: show it was taken, shoot as soon as the viewfinder is back
+            self.queued = True
+            self.flash.add_css_class("on")
+            GLib.timeout_add(70, lambda: self.flash.remove_css_class("on") or False)
             return
         if self.S["timer"]:
             self.finder.count = self.S["timer"]
             self.count_id = GLib.timeout_add(1000, self.countdown)
             return self.finder.queue_draw()
         self.capture()
+
+    def fire_queued(self, since):
+        if self.closing or self.asleep or self.rec:
+            return False
+        if self.pipe and not self.busy and time.monotonic() - self.started > .7:  # the viewfinder has settled
+            self.capture()
+            return False
+        return time.monotonic() - since < 3  # give up after three seconds
 
     def countdown(self):
         self.finder.count -= 1
@@ -1595,8 +1794,6 @@ class Cam(Gtk.ApplicationWindow):
             if name == "back" and zoom >= 1.9:
                 mode, frames = "full", 3
             size = modes[0][3]
-        if not S["stack"]:
-            frames = 1
         turn = (rot - self.theta if name == "back" else rot + self.theta) % 360  # the way the phone is held now
         dev = ["--zoom", f"{zoom:g}", "--size", str(size), "--rot", str(turn)]
         if self.meter:
@@ -1615,7 +1812,7 @@ class Cam(Gtk.ApplicationWindow):
             if all(man):  # fully manual: the photo is as bright as the settings make it
                 dev += ["--gain", "1"]
         self.busy = True
-        for w in (self.shutter, self.flip, self.gear):
+        for w in (self.flip, self.gear):  # the shutter stays live: a press now queues the next shot
             w.set_sensitive(False)
         self.shutter.add_css_class("snap")
         self.flash.add_css_class("on")
@@ -1626,7 +1823,8 @@ class Cam(Gtk.ApplicationWindow):
             self.show_thumb(snap, self.finder.rot, self.finder.mirror)
         self.finder.set_paintable(snap)
         os.makedirs(PICS, exist_ok=True)
-        path = output_name(time.time())
+        path = output_name(time.time(), self.S["anon"])
+        SHOT_T[path] = time.monotonic()
         threading.Thread(target=self.grab, args=(name, mode, frames, path, dev, man, S["flash"] == "FLASH", S["stack"],
                                                  S["dng"], S["mode"] == "pro" and S["ev"] or 0.0), daemon=True).start()
 
@@ -1639,15 +1837,17 @@ class Cam(Gtk.ApplicationWindow):
             self.set_led(True)
             time.sleep(.7)  # the automatic exposure takes the light in
         try:
-            exp, gain = map(float, subprocess.run([os.path.join(BIN, "phonecam-raw"), "--viewfinder", name],
-                                                  check=True, capture_output=True, text=True).stdout.split())
-        except (subprocess.CalledProcessError, ValueError, OSError):
+            exp, gain = raw_tool().viewfinder(name)
+        except (subprocess.CalledProcessError, ValueError, OSError, KeyError):
             exp, gain = 30000.0, 4.0
         exp, gain = man[0] or exp, man[1] or gain
         if not any(man):
             exp *= 2.0 ** min(ev, 0)  # negative compensation also protects the highlights in the raw data
             if exp > HANDHELD_US:
                 gain, exp = gain * exp / HANDHELD_US, HANDHELD_US
+        stack = stack == "STACKED" or (stack == "AUTO" and gain > DARK_GAIN)  # instant, or auto in daylight: one frame
+        if not stack:
+            frames = 1
         if gain > DARK_GAIN:
             if stack:
                 frames *= 2
@@ -1655,31 +1855,38 @@ class Cam(Gtk.ApplicationWindow):
                 mode, frames = "bin", 12 if stack else 1
                 i = dev.index("--size") + 1
                 dev = dev[:i] + [dev[i] if dev[i] != "0" else "8160"] + dev[i + 1:]
-        dev = dev + ["--exif", f"{exp:.0f},{gain * 100:.0f}"] + (["--dng", path[:-4] + ".dng"] if dng else [])
+        lap(path, "exposure measured")
+        dev = dev + ([] if self.S["anon"] else ["--exif", f"{exp:.0f},{gain * 100:.0f}", "--camera", name]) \
+            + (["--dng", path[:-4] + ".dng"] + (["--anon", "1"] if self.S["anon"] else []) if dng else [])
         stopped = threading.Event()
         GLib.idle_add(lambda: self.stop() or stopped.set())
         stopped.wait()
+        lap(path, "viewfinder stopped")
         raw = os.path.join(GLib.get_user_cache_dir(), os.path.basename(path) + ".raw")
         err = geo = None
         try:
-            geo = subprocess.run([os.path.join(BIN, "phonecam-raw"), name, mode, str(frames), f"{exp:.0f}",
-                                  f"{gain:.3f}", raw], check=True, capture_output=True, text=True).stdout.split()
+            geo = [str(v) for v in raw_tool().capture(name, mode, frames, float(f"{exp:.0f}"), float(f"{gain:.3f}"), raw)]
         except subprocess.CalledProcessError as e:
             err = ((e.stderr or "").strip().splitlines()[-1:] or [str(e)])[0]
-        except OSError as e:
+        except (OSError, SystemExit, subprocess.TimeoutExpired) as e:
             err = str(e)
         if flash:
             self.set_led(False)
+        lap(path, "raw captured")
         GLib.idle_add(self.grabbed, raw, geo, path, frames, dev, err)
 
     def grabbed(self, raw, geo, path, frames, dev, err):
         self.busy = False
-        for w in (self.shutter, self.flip, self.gear):
+        lap(path, "ready for the next shot")
+        for w in (self.flip, self.gear):
             w.set_sensitive(True)
         if self.asleep:
             self.release()
         elif not self.closing:
             self.start()
+            if self.queued:
+                self.queued = False
+                GLib.timeout_add(100, self.fire_queued, time.monotonic())
         if err:
             if os.path.exists(raw):
                 os.unlink(raw)
@@ -1697,7 +1904,7 @@ class Cam(Gtk.ApplicationWindow):
             raw, (w, h, stride, _rot, bayer, ccm), path, frames, dev = self.jobs.get()
             err = None
             try:
-                p = subprocess.Popen(["nice", "-n", "10", os.path.join(BIN, "phonecam-develop"), raw, w, h, stride,
+                p = subprocess.Popen((["nice", "-n", "10"] if frames > 1 else []) + [os.path.join(BIN, "phonecam-develop"), raw, w, h, stride,
                                       path + ".part.jpg", "--frames", str(frames), "--bayer", bayer,
                                       "--ccm", ccm, *dev], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 for line in p.stdout:
@@ -1732,6 +1939,8 @@ class Cam(Gtk.ApplicationWindow):
             self.last = path
             self.set_thumb(path)
             print(path, flush=True)
+            if os.environ.get("PHONECAM_DEBUG") and path in SHOT_T:
+                print("shutter-to-file %.2fs" % (time.monotonic() - SHOT_T.pop(path)), file=sys.stderr, flush=True)
         if self.closing and not self.pending and not self.busy:
             self.shutdown()
             self.destroy()
@@ -1805,8 +2014,27 @@ class Cam(Gtk.ApplicationWindow):
             Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(self.last), None)
 
 
-def output_name(t):
-    return os.path.join(PICS, time.strftime("IMG_%Y%m%d_%H%M%S.jpg", time.localtime(t)))
+SHOT_T = {}  # output path -> shutter press time, for the debug timing line
+_RAW = []
+
+
+def raw_tool():
+    """phonecam-raw loaded once, so a shot does not pay for two interpreter starts"""
+    if not _RAW:
+        from importlib.machinery import SourceFileLoader
+        _RAW.append(SourceFileLoader("phonecam_raw", os.path.join(BIN, "phonecam-raw")).load_module())
+    return _RAW[0]
+
+
+def lap(path, what):
+    if os.environ.get("PHONECAM_DEBUG") and path in SHOT_T:
+        print("  %.2fs %s" % (time.monotonic() - SHOT_T[path], what), file=sys.stderr, flush=True)
+
+
+def output_name(t, anon=False, kind="IMG", ext="jpg"):
+    """the time is in the name, unless the shot is anonymous: then it is random, and the name says nothing"""
+    stamp = os.urandom(6).hex() if anon else time.strftime("%Y%m%d_%H%M%S", time.localtime(t))
+    return os.path.join(PICS, f"{kind}_{stamp}.{ext}")
 
 
 def main():

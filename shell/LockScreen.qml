@@ -31,5 +31,10 @@ WlSessionLock {
                 }
             }
         }
+        Loader {
+            anchors.fill: parent
+            active: Droid.call !== null
+            source: "CallView.qml"
+        }
     }
 }

@@ -1,10 +1,11 @@
 import QtQuick
+import Quickshell
 
 Page {
     id: root
     property var images: []
     property bool listed: false
-    readonly property string current: S.phone.wallpaper || ""
+    readonly property string current: S.phone.wallpaper ?? Quickshell.shellDir.replace(/\/[^/]*\/?$/, "") + "/wallpapers/06-ribbons-dark.jpg"
     Cmd {
         running: true
         command: [S.pset, "images"]

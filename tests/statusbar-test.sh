@@ -22,6 +22,8 @@ cc -w -I"$BUILD" -o "$W/fakeapp" "$SRC/tests/fakeapp.c" "$BUILD/touchlog-xdg-pro
 
 mkdir -p "$W/cfg/phonegluewc" "$W/state/phonegluewc" "$W/nosys"
 printf 'remember_layout = false\noutput = * mode=1080x2400 scale=2.75\n' > "$W/cfg/phonegluewc/config.conf"
+# the pixel counts below are measured over Black, not the shipped default wallpaper
+echo "wallpaper = " >"$W/cfg/phonegluewc/phone.conf"
 printf '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><rect width="48" height="48" rx="12" fill="#20c060"/></svg>\n' >"$W/icon.svg"
 
 # fake /sys
@@ -185,6 +187,8 @@ import re,sys
 p=sys.argv[1]; s=open(p).read()
 s=re.sub(r' *StatusBar \{[^\n]*\n *LazyLoader \{\n[^\n]*panelLoaded\n[^\n]*\n *\}\n','',s)
 s=re.sub(r' *LazyLoader \{\n[^\n]*rotateOffer[^\n]*\n[^\n]*RotateButton[^\n]*\n *\}\n','',s)
+s=re.sub(r' *IpcHandler \{\n *target: \"charge\"\n(?:[^\n]*\n)*? *\}\n','',s)
+s=re.sub(r' *LazyLoader \{\n[^\n]*chargeShowing(?:[^\n]*\n)*?[^\n]*ChargeAnim[^\n]*\n *\}\n *\}\n','',s)
 open(p,'w').write(s)" "$W/shell-base/shell.qml"
 grep -q 'Status' "$W/shell-base/shell.qml" && { echo "FAIL baseline still loads the bar"; exit 1; }
 { echo "w 3000"; rss base idle; } >"$W/script"

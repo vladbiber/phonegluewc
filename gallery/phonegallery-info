@@ -1,0 +1,113 @@
+#!/usr/bin/python3 -I
+"""phonegallery-info FILE: prints "label<TAB>value" lines of details for a photo or a clip"""
+import os, struct, sys, time
+from fractions import Fraction
+
+
+def size(n):
+    return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{n / 1e3:.0f} KB"
+
+
+def exif(path):
+    """tags of the first APP1 Exif block: {tag: value}; tiny reader for the types cameras write"""
+    with open(path, "rb") as f:
+        head = f.read(262144)
+    i = head.find(b"Exif\0\0")
+    if head[:2] != b"\xff\xd8" or i < 0:
+        return {}
+    t = head[i + 6:]
+    e = "<" if t[:2] == b"II" else ">"
+    out = {}
+
+    def ifd(off):
+        n, = struct.unpack_from(e + "H", t, off)
+        for k in range(n):
+            tag, typ, cnt, val = struct.unpack_from(e + "HHI4s", t, off + 2 + 12 * k)
+            sz = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1}.get(typ, 0) * cnt
+            at = struct.unpack(e + "I", val)[0] if sz > 4 else off + 2 + 12 * k + 8
+            if not sz or at + sz > len(t):
+                continue
+            if typ == 2:
+                out[tag] = t[at:at + sz].split(b"\0")[0].decode("latin1")
+            elif typ == 3:
+                out[tag] = struct.unpack_from(e + "H", t, at)[0]
+            elif typ == 4:
+                out[tag] = struct.unpack_from(e + "I", t, at)[0]
+            elif typ == 5:
+                a, b = struct.unpack_from(e + "II", t, at)
+                out[tag] = Fraction(a, b) if b else 0
+        return out.get(34665)
+
+    try:
+        sub = ifd(struct.unpack_from(e + "I", t, 4)[0])
+        if sub:
+            ifd(sub)
+    except (struct.error, ValueError):
+        pass
+    return out
+
+
+def photo(path, rows):
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    _, w, h = GdkPixbuf.Pixbuf.get_file_info(path)
+    rows.extend([("Size", f"{w} × {h}"), ("Megapixels", f"{w * h / 1e6:.1f} MP")])
+    x = exif(path)
+    if 272 in x:
+        rows.append(("Camera", x[272]))
+    if 33434 in x and x[33434]:
+        s = Fraction(x[33434])
+        rows.append(("Exposure", f"1/{round(1 / s)} s" if s < 1 else f"{float(s):g} s"))
+    if 34855 in x:
+        rows.append(("ISO", str(x[34855])))
+    if 37386 in x:
+        rows.append(("Focal length", f"{float(x[37386]):g} mm"))
+    if 33437 in x:
+        rows.append(("Aperture", f"f/{float(x[33437]):g}"))
+
+
+def clip(path, rows):
+    import gi
+    gi.require_version("Gst", "1.0")
+    gi.require_version("GstPbutils", "1.0")
+    from gi.repository import Gst, GstPbutils
+    Gst.init(None)
+    try:
+        info = GstPbutils.Discoverer.new(5 * Gst.SECOND).discover_uri("file://" + path)
+    except Exception:
+        rows.append(("Status", "Damaged or unfinished"))
+        return
+    s = int(info.get_duration() // Gst.SECOND)
+    rows.append(("Duration", f"{s // 60}:{s % 60:02d}"))
+    for v in info.get_video_streams():
+        w, h = v.get_width(), v.get_height()
+        n, d = v.get_framerate_num(), v.get_framerate_denom()
+        rows.extend([("Size", f"{w} × {h}"), ("Megapixels", f"{w * h / 1e6:.1f} MP")])
+        if d:
+            rows.append(("Frame rate", f"{n / d:.0f} fps"))
+        rows.append(("Codec", GstPbutils.pb_utils_get_codec_description(v.get_caps())))
+    for a in info.get_audio_streams():
+        rows.append(("Audio", GstPbutils.pb_utils_get_codec_description(a.get_caps())))
+    if not info.get_video_streams():
+        rows.append(("Status", "Damaged or unfinished"))
+
+
+def main(path):
+    path = os.path.abspath(path)
+    st = os.stat(path)
+    rows = [("File", os.path.basename(path)), ("Date", time.strftime("%d %b %Y, %H:%M:%S", time.localtime(st.st_mtime)))]
+    try:
+        (clip if path.lower().endswith(".mp4") else photo)(path, rows)
+    except Exception as ex:
+        rows.append(("Status", f"Cannot read ({type(ex).__name__})"))
+    rows.append(("File size", size(st.st_size)))
+    for k, v in rows:
+        print(f"{k}\t{v}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit(__doc__.strip())
+    assert size(2.5e6) == "2.5 MB" and size(5e3) == "5 KB"
+    main(sys.argv[1])

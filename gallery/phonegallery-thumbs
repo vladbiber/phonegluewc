@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # phonegallery-thumbs SRC CACHE: prints each thumbnail path once it exists, newest photo first; drops stale ones
-import os, sys
+import os, re, sys, threading
 from concurrent.futures import ThreadPoolExecutor
 import gi
 gi.require_version("GdkPixbuf", "2.0")
@@ -10,8 +10,20 @@ SHORT = 384  # short side; a grid cell is about 360 physical px
 EXT = (".jpg", ".jpeg", ".png", ".webp", ".mp4")
 
 
+class Damaged(Exception):
+    pass
+
+
+CLIP = threading.Lock()  # one clip at a time: gstreamer pipelines built from several threads at once fail
+POSTER = 1080  # short side of a clip's full-screen first frame
+
+
 def key(e):
-    return f"{e.name}@{int(e.stat().st_mtime)}.jpg"
+    return f"{e.name}@{int(e.stat().st_mtime)}-2.jpg"
+
+
+def poster_of(thumb):
+    return thumb[:-4] + "-p.jpg"
 
 
 def clip_frame(src):
@@ -27,6 +39,12 @@ def clip_frame(src):
         p.set_state(Gst.State.PAUSED)
         sample = p.get_by_name("a").emit("try-pull-preroll", 5 * Gst.SECOND)
         if not sample:
+            err = p.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR)
+            msg = err.parse_error()[0].message if err else ""
+            if os.environ.get("PHONEGALLERY_DEBUG"):
+                print("thumb error:", src, msg, file=sys.stderr)
+            if re.search(r"playable|atom|moov", msg, re.I):
+                raise Damaged()  # the file itself is bad; any other failure is tried again next scan
             return None, 0
         ok, dur = p.query_duration(Gst.Format.TIME)
         st = sample.get_caps().get_structure(0)
@@ -45,26 +63,61 @@ def clock(seconds):
 
 
 def make_clip(src, dst):
-    """a clip's thumbnail carries its play mark and length, so the grid needs no second lookup"""
-    import cv2
+    """grid tile with a small play mark and the length bottom right, plus a big poster for the viewer"""
+    import cv2, numpy as np
     frame, seconds = clip_frame(src)
     if frame is None:
         return None
+    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    k = POSTER / min(bgr.shape[:2])
+    if k < 1:
+        cv2.imwrite(poster_of(dst) + ".part.jpg", cv2.resize(bgr, None, fx=k, fy=k, interpolation=cv2.INTER_AREA), [cv2.IMWRITE_JPEG_QUALITY, 88])
+    else:
+        cv2.imwrite(poster_of(dst) + ".part.jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    os.replace(poster_of(dst) + ".part.jpg", poster_of(dst))
     k = SHORT / min(frame.shape[:2])
-    im = cv2.cvtColor(cv2.resize(frame, None, fx=k, fy=k, interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2BGR)
+    im = cv2.resize(bgr, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
     h, w = im.shape[:2]
-    cx, cy, r = w // 2, h // 2, SHORT // 9
-    shade = im.copy()
-    cv2.circle(shade, (cx, cy), r, (0, 0, 0), -1, cv2.LINE_AA)
-    cv2.rectangle(shade, (cx - 60, cy + SHORT // 2 - 54), (cx + 60, cy + SHORT // 2 - 12), (0, 0, 0), -1)
-    im = cv2.addWeighted(shade, .55, im, .45, 0)
-    tri = [(cx - r // 3, cy - r // 2), (cx - r // 3, cy + r // 2), (cx + r // 2, cy)]
-    cv2.fillPoly(im, [__import__("numpy").array(tri)], (255, 255, 255), cv2.LINE_AA)
+    # the grid crops to a square, so the badge is placed in the square, not in the whole frame
+    y0c, x0c = (h - SHORT) // 2, (w - SHORT) // 2
+    im = np.ascontiguousarray(im[y0c:y0c + SHORT, x0c:x0c + SHORT])
+    h, w = im.shape[:2]
     text = clock(seconds)
-    (tw, _th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, .9, 2)
-    cv2.putText(im, text, (cx - tw // 2, cy + SHORT // 2 - 23), cv2.FONT_HERSHEY_SIMPLEX, .9, (255, 255, 255), 2, cv2.LINE_AA)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, .62, 1)
+    pw, ph, m = tw + 44, th + 18, 14
+    x1, y1 = w - m, h - m
+    x0, y0 = x1 - pw, y1 - ph
+    shade = im.copy()
+    cv2.rectangle(shade, (x0 + ph // 2, y0), (x1 - ph // 2, y1), (0, 0, 0), -1)
+    cv2.circle(shade, (x0 + ph // 2, y0 + ph // 2), ph // 2, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(shade, (x1 - ph // 2, y0 + ph // 2), ph // 2, (0, 0, 0), -1, cv2.LINE_AA)
+    im = cv2.addWeighted(shade, .6, im, .4, 0)
+    cy = y0 + ph // 2
+    tri = np.array([(x0 + 14, cy - 7), (x0 + 14, cy + 7), (x0 + 26, cy)])
+    cv2.fillPoly(im, [tri], (255, 255, 255), cv2.LINE_AA)
+    cv2.putText(im, text, (x0 + 33, cy + th // 2), cv2.FONT_HERSHEY_SIMPLEX, .62, (255, 255, 255), 1, cv2.LINE_AA)
     tmp = dst + ".part.jpg"
     cv2.imwrite(tmp, im, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    os.replace(tmp, dst)
+    return dst
+
+
+def broken(dst):
+    """a clip that will not open gets a quiet tile: a thin play outline with a slash and one small line of text"""
+    import cv2, numpy as np
+    im = np.full((SHORT, SHORT, 3), 24, np.uint8)
+    g = (120, 120, 120)
+    cx, cy = SHORT // 2, SHORT // 2 - 14
+    tri = np.array([(cx - 14, cy - 22), (cx + 24, cy), (cx - 14, cy + 22)])
+    cv2.polylines(im, [tri], True, g, 2, cv2.LINE_AA)
+    cv2.line(im, (cx - 30, cy + 30), (cx + 34, cy - 30), (24, 24, 24), 7, cv2.LINE_AA)
+    cv2.line(im, (cx - 30, cy + 30), (cx + 34, cy - 30), g, 2, cv2.LINE_AA)
+    text = "Can't play"
+    (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, .55, 1)
+    cv2.putText(im, text, ((SHORT - tw) // 2, cy + 74), cv2.FONT_HERSHEY_SIMPLEX, .55, g, 1, cv2.LINE_AA)
+    tmp = dst + ".part.jpg"
+    cv2.imwrite(poster_of(dst), im)
+    cv2.imwrite(tmp, im)
     os.replace(tmp, dst)
     return dst
 
@@ -72,8 +125,11 @@ def make_clip(src, dst):
 def make(src, dst):
     if src.lower().endswith(".mp4"):
         try:
-            return make_clip(src, dst)
-        except Exception:  # a clip still being written, a codec this phone cannot decode
+            with CLIP:
+                return make_clip(src, dst)  # None: not ready yet, tried again on the next scan, never cached as broken
+        except Damaged:
+            return broken(dst)
+        except Exception:  # a clip still being written
             return None
     try:
         _, w, h = GdkPixbuf.Pixbuf.get_file_info(src)
@@ -97,8 +153,9 @@ def main(src, cache):
         photos = []
     photos.sort(key=lambda e: e.stat().st_mtime, reverse=True)
     want = {key(e): e.path for e in photos}
+    keep = set(want) | {poster_of(k) for k in want if ".mp4@" in k}
     for name in os.listdir(cache):
-        if name not in want:
+        if name not in keep:
             try:
                 os.unlink(os.path.join(cache, name))
             except OSError:
@@ -106,17 +163,21 @@ def main(src, cache):
     todo = []
     for name, path in want.items():
         dst = os.path.join(cache, name)
-        if os.path.exists(dst):
+        if os.path.exists(dst) and (not path.lower().endswith(".mp4") or os.path.exists(poster_of(dst))):
             print(dst, flush=True)
+            if path.lower().endswith(".mp4"):
+                print(poster_of(dst), flush=True)
         else:
             todo.append((path, dst))
     with ThreadPoolExecutor(4) as pool:
         for dst in pool.map(lambda t: make(*t), todo):
             if dst:
                 print(dst, flush=True)
+                if ".mp4@" in dst and os.path.exists(poster_of(dst)):
+                    print(poster_of(dst), flush=True)
 
 
 if __name__ == "__main__":
-    assert key(type("E", (), {"name": "a.jpg", "stat": lambda s: os.stat_result((0,) * 8 + (12.7, 0))})()) == "a.jpg@12.jpg"
+    assert key(type("E", (), {"name": "a.jpg", "stat": lambda s: os.stat_result((0,) * 8 + (12.7, 0))})()) == "a.jpg@12-2.jpg"
     assert clock(0) == "0:00" and clock(75.9) == "1:15"
     main(sys.argv[1], sys.argv[2])

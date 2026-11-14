@@ -1,0 +1,9 @@
+[Unit]
+Description=Check once a minute whether Waydroid started since the gallery albums were shown to it
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target

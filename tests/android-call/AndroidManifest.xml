@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.phonegluewc.calltest" android:versionCode="2" android:versionName="2">
+    <uses-sdk android:minSdkVersion="31" android:targetSdkVersion="33" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <application android:label="Call test" android:hasCode="true" android:allowBackup="false">
+        <activity android:name=".Call" android:exported="true" />
+        <activity android:name=".Edit" android:exported="true" android:label="Type test" />
+        <receiver android:name=".R" android:exported="true" />
+        <service android:name=".Svc" android:exported="false" />
+    </application>
+</manifest>

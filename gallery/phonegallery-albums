@@ -1,0 +1,189 @@
+#!/usr/bin/python3 -I
+"""phonegallery-albums: albums are plain folders under ~/Pictures; "Camera" is the default one.
+
+  list                          name TAB count TAB newest file, one album per line
+  folders                       name TAB count for every folder Android could see (Videos folders as Videos_NAME)
+  create NAME | rename OLD NEW
+  delete NAME [--force]         refuses (exit 3, prints ONLY n) while files live only in that album
+  add ALBUM FILE...             hard link (copy if linking fails), a .dng next to a .jpg follows
+  move ALBUM FILE...            add, then the file is gone from where it was
+  remove ALBUM FILE... [--force]  drops this album's link; the last link needs --force (exit 3)
+  trash FILE...                 deletes every link of the file in every album, and its .dng
+Run with --selfcheck for the tests."""
+import os
+import re
+import shutil
+import sys
+
+ROOT = os.path.realpath(os.path.expanduser(os.environ.get("PHONEGALLERY_ROOT", "~/Pictures")))
+EXT = (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".dng")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
+
+
+def fail(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def album_dir(name):
+    if not NAME.match(name) or ".." in name:
+        fail(f"bad album name: {name!r}")
+    return os.path.join(ROOT, name)
+
+
+def real_file(path):
+    """a regular file (not a link) that really lives under the albums root"""
+    if os.path.islink(path) or not os.path.isfile(path):
+        fail(f"not a regular file: {path}")
+    p = os.path.realpath(path)
+    if os.path.dirname(os.path.dirname(p)) != ROOT or not p.lower().endswith(EXT):
+        fail(f"outside the albums: {path}")
+    return p
+
+
+def with_sidecar(p):
+    out = [p]
+    dng = os.path.splitext(p)[0] + ".dng"
+    if p.lower().endswith((".jpg", ".jpeg")) and os.path.isfile(dng) and not os.path.islink(dng):
+        out.append(dng)
+    return out
+
+
+def link(src, dst):
+    if os.path.exists(dst):
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def media(d):
+    return [e for e in os.scandir(d) if e.is_file(follow_symlinks=False) and e.name.lower().endswith(EXT)] if os.path.isdir(d) else []
+
+
+def albums():
+    return sorted((e.name for e in os.scandir(ROOT) if e.is_dir(follow_symlinks=False) and NAME.match(e.name)), key=lambda n: (n != "Camera", n.lower()))
+
+
+def only_here(d):
+    """files in album folder d that have no other link anywhere"""
+    return [e.path for e in media(d) if e.stat().st_nlink == 1]
+
+
+def cmd_list():
+    for n in albums():
+        files = [e for e in media(os.path.join(ROOT, n)) if not e.name.lower().endswith(".dng")]
+        files.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+        print(f"{n}\t{len(files)}\t{files[0].path if files else ''}")
+
+
+def cmd_folders():
+    """every folder Android could be shown: albums under Pictures, and folders under Videos as Videos_NAME"""
+    cmd_list_names = [(n, os.path.join(ROOT, n)) for n in albums()]
+    vroot = os.path.join(os.path.dirname(ROOT), "Videos")
+    if os.path.isdir(vroot):
+        cmd_list_names += [("Videos_" + e.name, e.path) for e in sorted(os.scandir(vroot), key=lambda e: e.name) if e.is_dir(follow_symlinks=False) and NAME.match(e.name)]
+    for n, d in cmd_list_names:
+        print(f"{n}\t{len([e for e in media(d) if not e.name.lower().endswith('.dng')])}")
+
+
+def cmd_add(album, files, move=False):
+    dst = album_dir(album)
+    os.makedirs(dst, exist_ok=True)
+    for f in files:
+        for p in with_sidecar(real_file(f)):
+            link(p, os.path.join(dst, os.path.basename(p)))
+            if move and os.path.dirname(p) != dst:
+                os.unlink(p)
+
+
+def cmd_remove(album, files, force):
+    d = album_dir(album)
+    paths = [p for f in files for p in with_sidecar(real_file(f)) if os.path.dirname(p) == d]
+    last = [p for p in paths if os.stat(p).st_nlink == 1]
+    if last and not force:
+        print(f"ONLY {len(last)}")
+        sys.exit(3)
+    for p in paths:
+        os.unlink(p)
+
+
+def cmd_trash(files):
+    inodes = {os.stat(p).st_ino for f in files for p in with_sidecar(real_file(f))}
+    for n in albums():
+        for e in media(os.path.join(ROOT, n)):
+            if e.stat().st_ino in inodes:
+                os.unlink(e.path)
+
+
+def main(a):
+    if a[:1] == ["list"] and len(a) == 1:
+        cmd_list()
+    elif a == ["folders"]:
+        cmd_folders()
+    elif a[:1] == ["create"] and len(a) == 2:
+        os.makedirs(album_dir(a[1]), exist_ok=False)
+    elif a[:1] == ["rename"] and len(a) == 3:
+        if a[1] == "Camera":
+            fail("Camera is the default album")
+        os.rename(album_dir(a[1]), album_dir(a[2]))
+    elif a[:1] == ["delete"] and a[1:2] and a[2:] in ([], ["--force"]):
+        d = album_dir(a[1])
+        if a[1] == "Camera":
+            fail("Camera is the default album")
+        lone = only_here(d)
+        if lone and a[2:] != ["--force"]:
+            print(f"ONLY {len(lone)}")
+            sys.exit(3)
+        for e in media(d):
+            os.unlink(e.path)
+        os.rmdir(d)
+    elif a[:1] in (["add"], ["move"]) and len(a) >= 3:
+        cmd_add(a[1], a[2:], move=a[0] == "move")
+    elif a[:1] == ["remove"] and len(a) >= 3:
+        force = a[-1] == "--force"
+        cmd_remove(a[1], a[2:-1] if force else a[2:], force)
+    elif a[:1] == ["trash"] and len(a) >= 2:
+        cmd_trash(a[1:])
+    else:
+        sys.exit(__doc__.strip())
+
+
+def selfcheck():
+    import subprocess
+    import tempfile
+    global ROOT
+    ROOT = os.path.realpath(tempfile.mkdtemp())
+    os.environ["PHONEGALLERY_ROOT"] = ROOT
+    cam = os.path.join(ROOT, "Camera")
+    os.makedirs(cam)
+    for n in ("a.jpg", "a.dng", "b.jpg", "c.mp4"):
+        open(os.path.join(cam, n), "w").write(n)
+    run = lambda *x: subprocess.run([sys.executable, __file__, *x], capture_output=True, text=True)
+    assert run("create", "Trip").returncode == 0 and run("create", "../x").returncode == 2 and run("create", "a/b").returncode == 2
+    assert run("add", "Trip", cam + "/a.jpg").returncode == 0
+    assert os.stat(cam + "/a.jpg").st_nlink == 2 and os.path.exists(ROOT + "/Trip/a.dng"), "hard link and sidecar"
+    assert run("add", "Trip", "/etc/passwd").returncode == 2 and run("add", "Trip", cam + "/../Camera/a.jpg").returncode == 0
+    os.symlink(cam + "/b.jpg", ROOT + "/Trip/ln.jpg")
+    assert run("add", "Trip", ROOT + "/Trip/ln.jpg").returncode == 2, "a symlink is refused"
+    assert run("move", "Trip", cam + "/b.jpg").returncode == 0 and not os.path.exists(cam + "/b.jpg"), "move leaves only the album"
+    assert run("remove", "Trip", ROOT + "/Trip/b.jpg").returncode == 3, "last link needs --force"
+    assert run("remove", "Trip", ROOT + "/Trip/a.jpg").returncode == 0 and os.path.exists(cam + "/a.jpg"), "other link stays"
+    os.unlink(ROOT + "/Trip/ln.jpg")
+    assert run("delete", "Trip").returncode == 3, "album with a lone file is not deleted silently"
+    assert run("delete", "Trip", "--force").returncode == 0 and not os.path.exists(ROOT + "/Trip")
+    run("create", "Two")
+    run("add", "Two", cam + "/c.mp4")
+    assert run("trash", cam + "/c.mp4").returncode == 0 and not os.path.exists(ROOT + "/Two/c.mp4") and not os.path.exists(cam + "/c.mp4")
+    out = run("list").stdout.split("\n")
+    assert out[0].startswith("Camera\t") and any(l.startswith("Two\t0") for l in out), out
+    shutil.rmtree(ROOT)
+    print("ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--selfcheck"]:
+        selfcheck()
+    else:
+        main(sys.argv[1:])

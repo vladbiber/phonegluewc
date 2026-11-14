@@ -237,6 +237,22 @@ bind_insert = mod+F6 = spawn:pamixer -i 5
 Volume up is capped at 100% with `wpctl -l 1.0`; drop the flag if you want the
 software boost above it.
 
+### Ringtone
+
+Settings, Sound, Ringtone lists every `/usr/share/sounds/*/ringtones/*.ogg` and
+any sound theme's `stereo/phone-incoming-call.oga`; a tap plays it and picks it.
+The choice is one line in `~/.config/phonegluewc/phone.conf`:
+
+```ini
+ringtone = /usr/share/sounds/lomiri/ringtones/Celestial.ogg
+```
+
+The shell reads it as `Phone.conf.ringtone`. No sound files ship in this
+repository. On postmarketOS and Alpine `install.sh` adds `lomiri-sounds`
+(29 ringtones from the UBports project, licensed CC0-1.0, CC-BY-3.0,
+CC-BY-SA-3.0 and CC-BY-4.0; the per-file credits are in that package's
+upstream `debian/copyright`, https://gitlab.com/ubports/development/apps/lomiri-sounds).
+
 ## Overview and gestures
 
 - Tap and release `Super` without another key to toggle the overview.

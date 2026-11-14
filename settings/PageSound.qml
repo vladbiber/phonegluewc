@@ -1,3 +1,4 @@
+import Quickshell.Io
 import QtQuick
 
 Page {
@@ -151,6 +152,50 @@ Page {
         onPicked: v => S.save(["set", "phone", "ringer", v])
     }
     Note { text: "For calls and notifications only. Music and videos keep playing." }
+    // what the shell plays for a call: phone.conf ringtone=<path>; tapping one previews and picks it
+    property var tones: []
+    Cmd {
+        id: toneList
+        running: true
+        command: ["sh", "-c", 'for f in /usr/share/sounds/*/ringtones/*.ogg /usr/share/sounds/*/stereo/phone-incoming-call.oga; do [ -f "$f" ] && echo "$f"; done']
+        onDone: root.tones = out.split("\n").filter(f => f).map(f => ({
+            path: f,
+            name: /phone-incoming-call/.test(f) ? f.split("/")[4].replace(/^./, c => c.toUpperCase()) + " call" : f.replace(/^.*\//, "").replace(/\.[^.]*$/, "")
+        }))
+    }
+    Process {
+        id: preview
+        property var next: null
+        function play(path) {
+            next = ["paplay", "--client-name=phonegluewc-ringtone", path];
+            if (running)
+                running = false;
+            else
+                start();
+        }
+        function start() {
+            command = next;
+            next = null;
+            running = true;
+        }
+        // the one playing stops first, then the new one starts
+        onExited: if (next) start()
+    }
+    Component.onDestruction: preview.running = false
+    Section { visible: root.tones.length > 0; text: "Ringtone" }
+    Repeater {
+        model: root.tones
+        delegate: RowItem {
+            required property var modelData
+            label: modelData.name
+            icon: "bell"
+            active: (S.phone.ringtone || "") === modelData.path
+            onTapped: {
+                preview.play(modelData.path);
+                S.save(["set", "phone", "ringtone", modelData.path]);
+            }
+        }
+    }
     RowItem {
         label: "Do not disturb"
         sub: "Silences alerts. Notifications still appear"

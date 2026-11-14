@@ -1,0 +1,7 @@
+[Unit]
+# on demand a frozen Waydroid with no window open still holds ~2 GB RAM and GPU buffers
+Description=Apply the Waydroid mode: stop it when idle, or keep it running
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/phone-waydroid-idle

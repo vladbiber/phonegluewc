@@ -38,6 +38,7 @@ Singleton {
         { id: "battery", label: "Battery", sub: "Level, charging, power button", icon: "power", keys: "battery charge charging health power button double triple press shortcut flashlight camera screenshot" },
         { id: "look", head: "Wallpaper", label: "Wallpaper and look", sub: "Dark or light, accent, wallpaper", icon: "palette", keys: "wallpaper background accent colour color theme look lock home dark light mode night" },
         { id: "apps", label: "Apps", sub: "Default browser, tray apps", icon: "grid", keys: "apps default browser pinned tray dock" },
+        { id: "waydroid", label: "Android apps", sub: "Keep Android running or not", icon: "grid", keys: "android waydroid whatsapp discord background always on battery memory ram" },
         { id: "keyboard", head: "Keyboard", label: "Language and keyboard", sub: "Layouts, suggestions", icon: "keyboard", keys: "language keyboard layout suggestions autocorrect autocomplete learn emoji clipboard history laptop xkb typing" },
         { id: "languages", parent: "keyboard", label: "Languages", sub: "Download typing and translation languages", icon: "keyboard", keys: "languages translate translation download dictionary" },
         { id: "camera", label: "Dynamic camera", sub: "Live activities around the camera", icon: "bright", keys: "dynamic camera hole notch cutout island pill activities live position" },

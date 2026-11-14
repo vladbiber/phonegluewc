@@ -1,0 +1,10 @@
+[Unit]
+# a reboot drops the read-only mounts that show Android its albums; this puts them back
+Description=Show Android the gallery albums the user chose
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sudo -n /usr/local/bin/phonegallery-android refresh
+
+[Install]
+WantedBy=default.target

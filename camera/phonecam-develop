@@ -159,7 +159,7 @@ def noise_sigma(y):
 
 
 def develop(src, black=64, rot=0, ccm_name="s5kjn1", sat=1.0, log=print, progress=lambda f: None,
-            meter=None, matrix=None, size=0, wb=None, ev=0.0, fixed_gain=None, aspect=0.0, dng=None, exif=None):
+            meter=None, matrix=None, size=0, wb=None, ev=0.0, fixed_gain=None, aspect=0.0, dng=None, exif=None, anon=False):
     acc, n = stack(src, log)
     src.data = None  # unmap the raw file
     h, w = acc.shape
@@ -178,7 +178,7 @@ def develop(src, black=64, rot=0, ccm_name="s5kjn1", sat=1.0, log=print, progres
     if dng:  # the stack as shot: sum of n frames, so black and white scale with n
         lib.write_dng(dng, w, h, acc.data, black * n, WHITE * n, (rg, bg),
                       CCMS[6890] if ccm_name == "s5kjn1" else np.eye(3).tolist(), rot=rot,
-                      exp_us=exif[0] if exif else 0, iso=exif[1] if exif else 0)
+                      exp_us=exif[0] if exif else 0, iso=exif[1] if exif else 0, anon=anon)
     progress(0.4)
 
     # Noise around black must not be clipped before demosaic: R and B carry more of it after WB,
@@ -372,11 +372,11 @@ if __name__ == "__main__":
                   log=lambda s: print(s, file=sys.stderr), progress=say,
                   meter=fl("--meter"), matrix=fl("--matrix"), size=int(opts.get("--size", 0)),
                   wb=fl("--wb"), ev=float(opts.get("--ev", 0)), fixed_gain=float(opts.get("--gain", 0)),
-                  aspect=float(opts.get("--aspect", 0)), dng=opts.get("--dng"), exif=fl("--exif"))
+                  aspect=float(opts.get("--aspect", 0)), dng=opts.get("--dng"), exif=fl("--exif"), anon="--anon" in opts)
     # 4:4:4 at 97: 4:2:0 at 93 left 16 px chroma squares and 8 px luma blocks in smooth dark areas
     if not cv2.imwrite(dst, img, [cv2.IMWRITE_JPEG_QUALITY, 97, cv2.IMWRITE_JPEG_SAMPLING_FACTOR,
                                   cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]):
         sys.exit(f"phonecam-develop: cannot write {dst}")
     if "--exif" in opts:
-        lib.add_exif(dst, *fl("--exif"), time.time())
+        lib.add_exif(dst, *fl("--exif"), time.time(), *(["Nothing Phone (1) " + opts["--camera"] + " camera"] if "--camera" in opts else []))
     say(1)

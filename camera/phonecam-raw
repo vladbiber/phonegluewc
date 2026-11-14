@@ -104,7 +104,7 @@ def capture(camera, mode, frames, exp_us, gain, out):
         while chunk := src.read(size):
             dst.write(chunk)
     os.unlink(tmp)
-    print(w, h, stride, rot, bayer, ccm)
+    return w, h, stride, rot, bayer, ccm
 
 
 if __name__ == "__main__":
@@ -116,7 +116,7 @@ if __name__ == "__main__":
         e, g = viewfinder(a[1])
         print(f"{e:.0f} {g:.3f}")
     elif len(a) == 6 and a[0] in SENSORS and a[1] in SENSORS[a[0]][2]:
-        capture(a[0], a[1], int(a[2]), float(a[3]), float(a[4]), a[5])
+        print(*capture(a[0], a[1], int(a[2]), float(a[3]), float(a[4]), a[5]))
     else:
         sys.exit(__doc__.strip() + "\n       phonecam-raw --viewfinder CAMERA   prints EXPOSURE_US GAIN"
                  "\n       phonecam-raw --fps CAMERA FPS      sets the running stream's frame rate")

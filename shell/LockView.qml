@@ -228,6 +228,11 @@ Item {
         onUnlocked: root.passed()
         onUsePassword: { root.usePassword = true; field.forceActiveFocus(); }
     }
+    Loader {
+        anchors.fill: parent
+        active: Status.chargeShowing
+        sourceComponent: ChargeAnim {}
+    }
     // above the lock's own touch areas, gone as soon as the password has a keystroke
     Loader {
         anchors.fill: parent

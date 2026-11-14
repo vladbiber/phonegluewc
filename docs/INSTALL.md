@@ -411,6 +411,32 @@ sudo make install
 `config.h` survives `git pull` because it is not tracked. When `config.def.h`
 gains new options upstream, diff the two files and copy over what you want.
 
+### Android apps (Waydroid)
+
+`make install` puts `phone-waydroid-idle` and its user timer in place and turns
+the timer on for every user from the next login; Settings > Android apps then
+picks when Android runs.
+
+The on-screen keyboard, the notifications and the incoming call screen reach
+Android through a small helper app. `make install` copies the prebuilt one to
+`/usr/local/share/phonegluewc/android/` (rebuild it with
+`sh keyboard/android/build.sh`, which needs the Android SDK). Install it into a
+running Waydroid session:
+
+```sh
+sudo cp /usr/local/share/phonegluewc/android/phonekbd-bridge.apk ~/.local/share/waydroid/data/local/tmp/
+sudo waydroid shell -- pm install -r /data/local/tmp/phonekbd-bridge.apk
+sudo waydroid shell -- ime enable org.phonegluewc.ime/.Bridge
+sudo waydroid shell -- ime set org.phonegluewc.ime/.Bridge
+sudo waydroid shell -- cmd notification allow_listener org.phonegluewc.ime/.Notifs
+sudo waydroid shell -- appops set org.phonegluewc.ime SYSTEM_ALERT_WINDOW allow
+```
+
+The last line lets the call buttons open the app's call screen. While the
+helper is connected, the shell drops Waydroid's own copies of the same
+notifications. Android's media volume stays at full; the phone's volume buttons
+set the level.
+
 ## Starting a session
 
 From a display manager, select **phonegluewc**. From a configured TTY:

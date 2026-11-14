@@ -39,7 +39,8 @@ Singleton {
     readonly property color accent: light && accentSaved === "#f5f5f5" ? "#111111" : accentSaved
     // not onAccent: Qt 6.10 reads that name as a signal handler and the binding never runs
     readonly property color inkOnAccent: 0.2126 * accent.r + 0.7152 * accent.g + 0.0722 * accent.b > 0.55 ? "#000000" : "#ffffff"
-    readonly property string wallpaper: conf.wallpaper || ""
+    // unset means the shipped default; an empty value is the Black choice
+    readonly property string wallpaper: conf.wallpaper ?? Quickshell.shellDir.replace(/\/[^/]*\/?$/, "") + "/wallpapers/06-ribbons-dark.jpg"
     readonly property string font: "Noto Sans"
 
     readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME")

@@ -198,6 +198,7 @@ Singleton {
 
     Process {
         id: poll
+        property real startedAt: 0
         stdout: StdioCollector {
             onStreamFinished: {
                 if (text === root.lastPoll)
@@ -209,6 +210,10 @@ Singleton {
                     if (i > 0)
                         o[line.slice(0, i)] = line.slice(i + 1).replace(/\\(.)/g, "$1");
                 }
+                // a value set here after this poll began, or still on its way out, beats what the poll read
+                for (const k in root.setAt)
+                    if (root.setAt[k] > poll.startedAt - 400 && root.s[k] !== undefined)
+                        o[k] = root.s[k];
                 root.s = o;
             }
         }
@@ -220,6 +225,7 @@ Singleton {
             return;
         }
         poll.command = ["sh", "-c", script, "phonestatus", sysDir, panelLoaded ? "open" : "", rotationFile];
+        poll.startedAt = Date.now();
         poll.running = true;
     }
     // a shell that starts locked still learns the volume and the torch once
@@ -241,6 +247,7 @@ for d in "$B"/power_supply/*; do
 	[ "$(cat "$d/scope" 2>/dev/null)" = Device ] && continue
 	echo "bat=$(cat "$d/capacity" 2>/dev/null)"
 	echo "batstate=$(cat "$d/status" 2>/dev/null)"
+	echo "batdir=$d"
 	break
 done
 if command -v nmcli >/dev/null; then
@@ -293,6 +300,74 @@ fi
 exit 0
 `
 
+    // ---- charger in or out: read each second without a process, so it shows at once, also locked or dark ----
+    readonly property string batDir: s.batdir || ""
+    property string plugState: ""
+    // reload answers later, in onLoaded
+    Timer {
+        interval: 1000
+        repeat: true
+        running: root.batDir !== ""
+        onTriggered: { batLevel.reload(); batStatus.reload(); }
+    }
+    FileView { id: batLevel; path: root.batDir ? root.batDir + "/capacity" : ""; printErrors: false }
+    FileView {
+        id: batStatus
+        path: root.batDir ? root.batDir + "/status" : ""
+        printErrors: false
+        onLoaded: {
+            const t = text().trim();
+            const was = root.plugState;
+            root.plugState = t;
+            const on = v => ["Charging", "Full", "Not charging"].includes(v);
+            if (was === "" || t === "" || on(t) === on(was))
+                return;
+            const level = parseInt(batLevel.text()) || root.battery;
+            // the level is left to the poll: this read of it can be a second old
+            root.s = Object.assign({}, root.s, { batstate: t });
+            // the same switch as the dynamic camera's charging alerts
+            if (Phone.conf.dyn_charging !== "off")
+                root.charged(on(t), level);
+        }
+    }
+    // the animation's state; a dark screen lights for it and goes dark again unless someone started using it
+    property int chargeSeq: 0
+    property bool chargePlugged: false
+    property int chargeLevel: 0
+    property bool chargeShowing: false
+    property bool chargeWoke: false
+    function charged(plugged, level) {
+        chargePlugged = plugged;
+        chargeLevel = Math.max(0, Math.min(100, level));
+        chargeWoke = chargeWoke || Phone.screenOff;
+        if (Phone.screenOff)
+            Quickshell.execDetached(["phonegluewc-msg", "power", "on"]);
+        // hidden a moment so a second plug while showing starts the animation over
+        chargeShowing = false;
+        chargeHold.stop();
+        chargeLit.interval = Phone.screenOff ? 300 : 60;
+        chargeLit.restart();
+    }
+    // a dark screen fades in for 200 ms first
+    Timer {
+        id: chargeLit
+        onTriggered: {
+            root.chargeShowing = true;
+            root.chargeSeq++;
+            chargeHold.restart();
+        }
+    }
+    Timer {
+        id: chargeHold
+        interval: 3000
+        onTriggered: {
+            root.chargeShowing = false;
+            if (root.chargeWoke && Phone.lockOpen && !Phone.lockTyped && !Phone.screenOff)
+                Quickshell.execDetached(["phonegluewc-msg", "power", "off"]);
+            root.chargeWoke = false;
+        }
+    }
+
     // ---- actions ----
     function run(cmd) {
         Quickshell.execDetached(cmd);
@@ -309,8 +384,12 @@ exit 0
             root.pending = {};
         }
     }
+    // when each field was last set here
+    property var setAt: ({})
     function later(key, cmd, patch) {
         pending[key] = cmd;
+        for (const k in patch)
+            setAt[k] = Date.now();
         s = Object.assign({}, s, patch);
         flush.start();
     }
@@ -334,11 +413,14 @@ exit 0
     }
     function toggleMute() { run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]); }
     // a hardware key: the new level shows at once, wpctl follows
+    // the bar shows on every press, also one that hits either end
+    signal volumeStepped()
     function stepVolume(d) {
         if (hasVolume)
             setVolume(Math.max(0, Math.min(1, Math.round((volume + d) * 20) / 20)));
         else
             run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "5%" + (d > 0 ? "+" : "-")]);
+        volumeStepped();
     }
     function setVolume(v) {
         const p = Math.round(v * 100);
@@ -456,6 +538,11 @@ exit 0
         imageSupported: false
         actionsSupported: false
         onNotification: n => {
+            // Waydroid reposts every update and summary over D-Bus; Droid has the real ones
+            if ((Droid.live && /^waydroid\./.test(n.desktopEntry || "")) || (!n.summary && !n.body)) {
+                n.dismiss();
+                return;
+            }
             root.notifs = [{
                 app: n.appName || "",
                 icon: (n.appIcon || "").replace(/^file:\/\//, ""),

@@ -97,6 +97,7 @@ Singleton {
         }
         // later: Status's bindings on s update after this handler
         function onSChanged() { Qt.callLater(root.polled); }
+        function onVolumeStepped() { if (root.allowed("levels") && Status.hasVolume) Qt.callLater(root.volumeShown); }
         function onNotifsChanged() { root.notified(); }
         function onRingerChanged() {
             if (root.allowed("ringer"))
@@ -134,6 +135,7 @@ Singleton {
     }
     function cancelTimer() { timerDone.stop(); timerEnd = 0; }
 
+    function volumeShown() { event("levels", "level", Status.volIcon, "Volume", "", 1800, { progress: Status.muted ? 0 : Status.volume, page: "sound" }); }
     // what the polled state said last time, a change becomes a short activity
     property var lastS: null
     function polled() {
@@ -147,14 +149,13 @@ Singleton {
         if (!was)
             return;
         if (Status.hasBattery) {
-            if (now.charging && !was.charging && allowed("charging"))
-                event("charging", "charging", "bolt", "Charging", now.bat + "%", 3500, { tone: "green", page: "battery", progress: now.bat / 100 });
-            else if (!now.charging && allowed("charging") && [15, 5].some(l => now.bat <= l && was.bat > l))
+            // plugging in has its own animation, ChargeAnim
+            if (!now.charging && allowed("charging") && [15, 5].some(l => now.bat <= l && was.bat > l))
                 event("charging", "lowbat", "battlow", "Low battery", now.bat + "%", 5000, { tone: "red", page: "battery", progress: now.bat / 100 });
         }
         if (allowed("levels") && !Status.panelLoaded) {
             if (was.vol !== undefined && (now.vol !== was.vol || now.muted !== was.muted))
-                event("levels", "level", Status.volIcon, "Volume", "", 1800, { progress: Status.muted ? 0 : Status.volume, page: "sound" });
+                volumeShown();
             else if (was.bl !== undefined && now.bl !== was.bl)
                 event("levels", "level", "sun", "Brightness", "", 1800, { progress: Status.brightness, page: "display" });
         }

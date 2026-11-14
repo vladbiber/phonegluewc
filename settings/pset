@@ -89,6 +89,8 @@ set)
 	kbd:long_press) case $3 in short | normal | long) ;; *) die "bad value" ;; esac ;;
 	kbd:predict_languages) [ -z "$3" ] || printf '%s' "$3" | grep -Eqx '[a-z][a-z-]{1,11}( [a-z][a-z-]{1,11}){0,31}' || die "bad languages" ;;
 	phone:ringer) case $3 in normal | vibrate | silent) ;; *) die "bad value" ;; esac ;;
+	phone:waydroid) case $3 in on_demand | always | hybrid) ;; *) die "bad value" ;; esac ;;
+	phone:ringtone) case $3 in /*) [ -f "$3" ] || die "no such sound file" ;; *) die "ringtone must be an absolute path" ;; esac ;;
 	phone:theme) case $3 in dark | light) ;; *) die "bad value" ;; esac ;;
 	phone:power_double | phone:power_triple) case $3 in camera | flashlight | screenshot | none) ;; *) die "bad value" ;; esac ;;
 	phone:dnd | phone:animations | phone:dynamic_camera) case $3 in on | off) ;; *) die "bad value" ;; esac ;;
@@ -112,6 +114,8 @@ set)
 	config) setkey "$cfg/phonegluewc/config.conf" "$2" "$3" " = " ;;
 	kbd) setkey "$cfg/phonekbd/config" "$2" "$3" " = " create ;;
 	esac
+	# the new mode applies now, not at the next 5 minute check
+	[ "$1:$2" != phone:waydroid ] || systemctl --user start --no-block phone-waydroid-idle.service 2>/dev/null || :
 	;;
 wallpaper)
 	[ $# = 1 ] || die "usage: wallpaper PATH"

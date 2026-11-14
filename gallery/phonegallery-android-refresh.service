@@ -1,0 +1,7 @@
+[Unit]
+# Waydroid only sees mounts that existed when it started; this mounts the chosen albums again after a start
+Description=Show Android the chosen gallery albums again after a Waydroid start
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sudo -n /usr/local/bin/phonegallery-android refresh

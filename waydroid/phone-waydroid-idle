@@ -1,0 +1,51 @@
+#!/bin/sh
+# phone-waydroid-idle: applies the Waydroid mode from phone.conf (waydroid = on_demand | always | hybrid)
+# on_demand: stop the session when it is frozen and has no window; app launch starts it again
+# always: start it with the session and never let it freeze or stop
+# hybrid: like always while one of waydroid_keep is installed, otherwise like on_demand
+RUN=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+FLAG=$RUN/waydroid-idle
+CG=/sys/fs/cgroup/lxc.payload.waydroid
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/phonegluewc/phone.conf
+APPS=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+# set while Android is told not to suspend; the property lasts across restarts, so this does too
+AWAKE=${XDG_STATE_HOME:-$HOME/.local/state}/phonegluewc/waydroid-awake
+get() { awk -v k="$1" '{ s = $0; sub(/^[ \t]+/, "", s); n = index(s, "=") } n && substr(s, 1, 1) != "#" { x = substr(s, 1, n - 1); sub(/[ \t]+$/, "", x); if (x == k) { v = substr(s, n + 1); sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v) } } END { print v }' "$CONF" 2>/dev/null; }
+mode=$(get waydroid)
+keep=$(get waydroid_keep)
+[ -n "$keep" ] || keep="com.whatsapp com.discord"
+if [ "$mode" = hybrid ]; then
+	mode=on_demand
+	for p in $keep; do [ -e "$APPS/waydroid.$p.desktop" ] && mode=always; done
+fi
+sock=$(ls "$RUN"/wayland-? 2>/dev/null | head -1)
+running() { [ -e $CG/cgroup.freeze ]; }
+if [ "$mode" = always ]; then
+	rm -f "$FLAG"
+	if ! running; then
+		[ -n "$sock" ] || exit 0
+		# its own unit, so it outlives this oneshot; the window display is taken from the session
+		systemctl --user is-active -q phone-waydroid.service ||
+			systemd-run --user -q --unit=phone-waydroid --setenv=WAYLAND_DISPLAY="${sock##*/}" waydroid session start
+		for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+			waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING' && break
+			sleep 2
+		done
+	fi
+	[ -e "$AWAKE" ] || { waydroid prop set persist.waydroid.suspend false && mkdir -p "${AWAKE%/*}" && : >"$AWAKE"; }
+	[ "$(cat $CG/cgroup.freeze 2>/dev/null)" = 1 ] &&
+		python3 -c 'import dbus; dbus.SystemBus().get_object("id.waydro.Container", "/ContainerManager").Unfreeze(dbus_interface="id.waydro.ContainerManager")'
+	exit 0
+fi
+running || { rm -f "$FLAG"; exit 0; }
+# back to the old way: Android freezes itself after its display timeout
+[ -e "$AWAKE" ] && waydroid prop set persist.waydroid.suspend true && rm -f "$AWAKE"
+[ "$(cat $CG/cgroup.freeze 2>/dev/null)" = 1 ] || { rm -f "$FLAG"; exit 0; }
+[ -n "$sock" ] || exit 0
+wins=$(WAYLAND_DISPLAY=${sock##*/} wlrctl toplevel list) || exit 0
+if printf '%s\n' "$wins" | grep -qi waydroid; then rm -f "$FLAG"; exit 0; fi
+# two idle checks in a row of the same container (its cgroup is new each start), so a fresh session gets one period of grace
+id=$(stat -c %i $CG)
+[ "$(cat "$FLAG" 2>/dev/null)" = "$id" ] || { echo "$id" >"$FLAG"; exit 0; }
+rm -f "$FLAG"
+exec waydroid session stop

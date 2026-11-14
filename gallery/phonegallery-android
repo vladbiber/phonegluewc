@@ -1,0 +1,344 @@
+#!/usr/bin/python3 -I
+"""phonegallery-android: the one root helper of the gallery, run through sudo (see docs/GALLERY.md).
+
+  send [--strip] FILE...     copy photos or clips into the one Android folder (Pictures/PhoneGallery)
+  clear                      delete the copies this helper made, nothing else
+  refresh                    make the mounts match gallery-android.conf, and mount again if Waydroid started since
+  expose-none                unmount whatever expose-albums / expose-all mounted
+  expose-albums NAME...      Android sees exactly these albums, each read-only in its own folder
+  expose-all                 the same for every album under Pictures and every folder under Videos (as Videos_NAME)
+
+Every argument is checked here; the caller is not trusted. Sources must be regular files (no links) directly
+inside a folder of /home/USER/Pictures or /home/USER/Videos, albums are plain names, the destination and the mount points are fixed.
+python3 phonegallery-android --selfcheck runs the tests."""
+import os
+import pwd
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+USER = os.environ.get("PHONEGALLERY_USER", "user")
+HOME = pwd.getpwnam(USER).pw_dir
+ROOTS = [os.path.realpath(os.path.join(HOME, "Pictures")), os.path.realpath(os.path.join(HOME, "Videos"))]  # albums live under the first
+MEDIA = os.environ.get("PHONEGALLERY_MEDIA", os.path.join(HOME, ".local/share/waydroid/data/media/0"))
+DEST = os.path.join(MEDIA, "Pictures", "PhoneGallery")
+VIEW = os.path.join(MEDIA, "Pictures", "PhoneGalleryView")
+STATE = os.environ.get("PHONEGALLERY_STATE", "/var/lib/phonegallery-android")
+MANIFEST = os.path.join(STATE, "sent")
+EXT = (".jpg", ".jpeg", ".png", ".webp", ".mp4")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
+
+
+def die(msg):
+    print(f"phonegallery-android: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def source(path):
+    """a regular file straight inside a folder of Pictures, resolved without following any link"""
+    if not os.path.isabs(path) or os.path.islink(path) or not os.path.isfile(path):
+        die(f"not a regular file: {path}")
+    p = os.path.realpath(path)
+    if p != path:  # a link anywhere in the path, or a dot segment
+        die(f"path goes through a link or has dot segments: {path}")
+    if not any(os.path.dirname(os.path.dirname(p)) == r for r in ROOTS) or not p.lower().endswith(EXT):
+        die(f"outside the photo folders: {path}")
+    return p
+
+
+def strip_jpeg(data):
+    """no APPn (EXIF, XMP, ICC...) and no comments; the picture and its tables are kept"""
+    if data[:2] != b"\xff\xd8":
+        return data
+    out, i = [data[:2]], 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        m = data[i + 1]
+        if m == 0xDA:
+            break
+        ln = struct.unpack(">H", data[i + 2:i + 4])[0]
+        if not (0xE1 <= m <= 0xEF or m == 0xFE):
+            out.append(data[i:i + 2 + ln])
+        i += 2 + ln
+    return b"".join(out) + data[i:]
+
+
+def strip_mp4(path):
+    """times zero, no user-data box, x264 note blanked; sizes unchanged"""
+    with open(path, "r+b") as f:
+        def walk(start, end):
+            pos = start
+            while pos + 8 <= end:
+                f.seek(pos)
+                size, kind = struct.unpack(">I4s", f.read(8))
+                hdr = 8
+                if size == 1:
+                    size, hdr = struct.unpack(">Q", f.read(8))[0], 16
+                elif size == 0:
+                    size = end - pos
+                if size < hdr or pos + size > end:
+                    break
+                if kind in (b"moov", b"trak", b"mdia"):
+                    walk(pos + hdr, pos + size)
+                elif kind in (b"mvhd", b"tkhd", b"mdhd"):
+                    ver = f.read(1)[0]
+                    f.seek(pos + hdr + 4)
+                    f.write(bytes(16 if ver else 8))
+                elif kind == b"udta":
+                    f.seek(pos + 4)
+                    f.write(b"free" + bytes(size - hdr))
+                pos += size
+        f.seek(0, 2)
+        walk(0, f.tell())
+        f.seek(0)
+        head = f.read(4 << 20)
+        at = head.find(bytes.fromhex("dc45e9bde6d948b7962cd820d923eeef"))
+        if at >= 0:
+            end = head.find(b"\0", at + 16)
+            f.seek(at)
+            f.write(b"\x11" * 16 + b" " * ((end if end > 0 else at + 16) - at - 16))
+
+
+def owner():
+    st = os.stat(os.path.dirname(DEST))
+    return st.st_uid, st.st_gid
+
+
+def put(path, strip):
+    uid, gid = owner()
+    os.makedirs(DEST, exist_ok=True)
+    os.chown(DEST, uid, gid)
+    os.chmod(DEST, 0o2770)
+    ext = os.path.splitext(path)[1].lower()
+    name = (os.urandom(6).hex() if strip else os.path.splitext(os.path.basename(path))[0]) + ext
+    dst = os.path.join(DEST, name)
+    n = 0
+    while os.path.exists(dst):
+        n += 1
+        dst = os.path.join(DEST, f"{os.path.splitext(name)[0]}-{n}{ext}")
+    shutil.copyfile(path, dst)
+    if strip:
+        if ext in (".jpg", ".jpeg"):
+            with open(dst, "rb") as f:
+                data = strip_jpeg(f.read())
+            with open(dst, "wb") as f:
+                f.write(data)
+        elif ext == ".mp4":
+            strip_mp4(dst)
+        os.utime(dst, (time.time(), time.time()))  # the copy does not carry the time it was taken
+    os.chown(dst, uid, gid)
+    os.chmod(dst, 0o660)
+    os.makedirs(STATE, exist_ok=True)
+    with open(MANIFEST, "a") as f:
+        f.write(dst + "\n")
+    return dst
+
+
+def scan_many(paths):
+    """ask Android's media scanner about these files in one go; fine if the container is not running"""
+    if not paths:
+        return
+    cmds = "; ".join("am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d " + shlex.quote("file:///storage/emulated/0/" + os.path.relpath(p, MEDIA)) for p in paths)
+    subprocess.run(["waydroid", "shell", "--", "sh", "-c", cmds], capture_output=True, timeout=300, check=False)
+
+
+def scan(path):
+    scan_many([path])
+
+
+def clear():
+    done = []
+    if os.path.exists(MANIFEST):
+        for line in open(MANIFEST).read().splitlines():
+            if os.path.dirname(line) == DEST and os.path.isfile(line) and not os.path.islink(line):
+                os.unlink(line)
+                done.append(line)
+        os.unlink(MANIFEST)
+    scan_many(done)
+    return len(done)
+
+
+CGROUP = os.environ.get("PHONEGALLERY_CGROUP", "/sys/fs/cgroup/lxc.payload.waydroid")
+EXPOSED = os.path.join(STATE, "exposed")  # album names, one per line, and the container start they were mounted under
+
+
+def container_stamp():
+    """changes whenever the Waydroid container starts: its cgroup is made again"""
+    try:
+        return str(os.stat(CGROUP).st_ctime_ns)
+    except OSError:
+        return ""
+
+
+def wanted():
+    """what the user's gallery-android.conf asks for, as album names that exist"""
+    mode, albums = "send", []
+    try:
+        for line in open(os.path.join(HOME, ".config/phonegluewc/gallery-android.conf")):
+            k, _, v = line.strip().partition("=")
+            if k == "mode":
+                mode = v
+            elif k == "albums":
+                albums = [n for n in v.split(",") if n]
+    except OSError:
+        pass
+    names = all_albums() if mode == "all" else albums if mode == "album" else []
+    ok = []
+    for n in dict.fromkeys(names):
+        try:
+            album_dir(n)
+            ok.append(n)
+        except SystemExit:
+            pass  # a deleted or odd name in the conf: not shown, not fatal
+    return ok
+
+
+def refresh():
+    """make the mounts match the conf (mount what is missing, unmount what should not be there), and mount again
+    when Waydroid started since: a container only sees mounts that existed when it started"""
+    want = wanted()
+    have = sorted(os.path.basename(m) for m in mounts())
+    stamp = ""
+    try:
+        stamp = open(EXPOSED).read().splitlines()[0]
+    except (OSError, IndexError):
+        pass
+    if sorted(want) != have or (want and container_stamp() != "" and stamp != container_stamp()):
+        expose(want)
+
+
+def mounts():
+    """every mount point of ours: one folder per exposed album inside VIEW"""
+    return sorted((l.split()[1] for l in open("/proc/mounts") if len(l.split()) > 1 and l.split()[1].startswith(VIEW + "/")), reverse=True)
+
+
+def media_names(d):
+    return sorted(e.name for e in os.scandir(d) if e.is_file() and e.name.lower().endswith(EXT))
+
+
+def unexpose():
+    seen = []
+    for m in mounts():
+        seen += [os.path.join(m, n) for n in media_names(m)]
+        subprocess.run(["umount", m], check=True)
+        os.rmdir(m)
+    if os.path.isdir(VIEW) and not os.listdir(VIEW):
+        os.rmdir(VIEW)
+    if os.path.exists(EXPOSED):
+        os.unlink(EXPOSED)
+    scan_many(seen)  # the files are gone from the mount point: the scanner drops them from Android's index
+
+
+def album_dir(name):
+    if not NAME.match(name) or ".." in name:
+        die(f"bad album name: {name!r}")
+    d = os.path.join(ROOTS[1], name[7:]) if name.startswith("Videos_") else os.path.join(ROOTS[0], name)
+    if os.path.islink(d) or not os.path.isdir(d):
+        die(f"no such album: {name}")
+    return d
+
+
+def expose(names):
+    """exactly these albums, each read-only in its own folder; anything exposed before is put away first"""
+    dirs = [(n, album_dir(n)) for n in dict.fromkeys(names)]
+    unexpose()
+    if not dirs:
+        return
+    uid, gid = owner()
+    os.makedirs(VIEW, exist_ok=True)
+    os.chown(VIEW, uid, gid)
+    os.chmod(VIEW, 0o2770)
+    os.makedirs(STATE, exist_ok=True)
+    with open(EXPOSED, "w") as f:
+        f.write("\n".join([container_stamp()] + [n for n, _ in dirs]) + "\n")
+    for n, d in dirs:
+        mp = os.path.join(VIEW, n)
+        os.makedirs(mp, exist_ok=True)
+        subprocess.run(["mount", "--bind", d, mp], check=True)
+        subprocess.run(["mount", "-o", "remount,bind,ro", mp], check=True)
+        scan_many([os.path.join(mp, f) for f in media_names(mp)])
+
+
+def all_albums():
+    """Pictures folders by name, Videos folders as Videos_NAME"""
+    out = sorted(e.name for e in os.scandir(ROOTS[0]) if e.is_dir(follow_symlinks=False) and NAME.match(e.name))
+    if os.path.isdir(ROOTS[1]):
+        out += sorted("Videos_" + e.name for e in os.scandir(ROOTS[1]) if e.is_dir(follow_symlinks=False) and NAME.match(e.name))
+    return out
+
+
+def main(a):
+    if os.geteuid() != 0 and "--dry" not in a:
+        die("must run as root")
+    if a[:1] == ["send"] and len(a) >= 2:
+        strip = a[1] == "--strip"
+        files = [source(p) for p in (a[2:] if strip else a[1:])]
+        for p in files:
+            scan(put(p, strip))
+        print(len(files))
+    elif a == ["clear"]:
+        print(clear())
+    elif a == ["refresh"]:
+        refresh()
+    elif a == ["expose-none"]:
+        unexpose()
+    elif a[:1] == ["expose-albums"] and len(a) >= 2:
+        expose(a[1:])
+    elif a == ["expose-all"]:
+        expose(all_albums())
+    else:
+        sys.exit(__doc__.strip())
+
+
+def selfcheck():
+    import tempfile
+    global HOME, ROOTS, MEDIA, DEST, VIEW, STATE, MANIFEST
+    tmp = os.path.realpath(tempfile.mkdtemp())
+    HOME = tmp
+    ROOTS = [tmp + "/Pictures", tmp + "/Videos"]
+    os.makedirs(ROOTS[0] + "/Camera")
+    good = ROOTS[0] + "/Camera/a.jpg"
+    open(good, "wb").write(b"\xff\xd8\xff\xe1\x00\x08Exif\0\0\xff\xdb\x00\x04ab\xff\xda\x00\x02data")
+    os.symlink(good, ROOTS[0] + "/Camera/ln.jpg")
+    open(tmp + "/secret.jpg", "w").write("x")
+    os.symlink(ROOTS[0] + "/Camera", ROOTS[0] + "/Link")
+    open(ROOTS[0] + "/top.jpg", "w").write("x")
+    bad = [ROOTS[0] + "/Camera/../../secret.jpg", ROOTS[0] + "/Camera/ln.jpg", tmp + "/secret.jpg", "Pictures/Camera/a.jpg", "/etc/passwd",
+           ROOTS[0] + "/Link/a.jpg", ROOTS[0] + "/top.jpg", ROOTS[0] + "/Camera/a.jpg/../a.jpg", ROOTS[0] + "/Camera"]
+    for p in bad:
+        try:
+            source(p)
+        except SystemExit:
+            continue
+        raise AssertionError(f"accepted {p}")
+    assert source(good) == good
+    assert strip_jpeg(open(good, "rb").read()) == b"\xff\xd8\xff\xdb\x00\x04ab\xff\xda\x00\x02data", "EXIF segment dropped, the rest kept"
+    os.makedirs(tmp + "/.config/phonegluewc")
+    open(tmp + "/.config/phonegluewc/gallery-android.conf", "w").write("mode=album\nalbums=Camera,../x,Gone\n")
+    assert wanted() == ["Camera"], "bad and missing names in the conf are dropped"
+    open(tmp + "/.config/phonegluewc/gallery-android.conf", "w").write("mode=all\n")
+    assert wanted() == ["Camera"]
+    os.makedirs(tmp + "/Videos/Clips")
+    assert album_dir("Videos_Clips") == tmp + "/Videos/Clips" and all_albums() == ["Camera", "Videos_Clips"]
+    open(tmp + "/Videos/Clips/v.mp4", "w").write("x")
+    assert source(tmp + "/Videos/Clips/v.mp4") == tmp + "/Videos/Clips/v.mp4", "clips can be sent"
+    for n in ("../x", "Link", "Nope", "a/b", ".hidden"):
+        try:
+            album_dir(n)
+        except SystemExit:
+            continue
+        raise AssertionError(f"accepted album {n}")
+    assert album_dir("Camera") == ROOTS[0] + "/Camera"
+    for n in ("../x", "a/b", "", "-a", "a" * 41):
+        assert not NAME.match(n) or ".." in n
+    print("ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--selfcheck"]:
+        selfcheck()
+    else:
+        main(sys.argv[1:])

@@ -22,7 +22,9 @@ MSGLIBS   = `$(PKG_CONFIG) --libs wayland-client` $(LIBS)
 all: phonegluewc phonegluewc-msg phonecamera phonepin keyboard/phonekbd screentext/phonetext
 
 check: phonegluewc
-	sh -n install.sh phonegluewc-session phonegluewc-backlight phonegluewc-sensor tests/drm-test.sh settings/phonesettings settings/pset gallery/phonegallery
+	sh -n install.sh phonegluewc-session phonegluewc-backlight phonegluewc-sensor tests/drm-test.sh settings/phonesettings settings/pset gallery/phonegallery gallery/phonegallery-android-apply waydroid/phone-waydroid-idle
+	PHONEGALLERY_USER=$${USER:-root} python3 gallery/phonegallery-android --selfcheck >/dev/null 2>&1
+	python3 gallery/phonegallery-albums --selfcheck
 	$(MAKE) -C tests
 HYPROBJS =
 phonegluewc: phonegluewc.o util.o dwl-ipc-unstable-v2-protocol.o $(HYPROBJS)
@@ -164,8 +166,30 @@ install: phonegluewc phonegluewc-msg phonecamera phonepin keyboard/phonekbd scre
 	chmod 644 $(DESTDIR)$(DATADIR)/applications/phonegallery.desktop
 	cp -f gallery/phonegallery.svg $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps
 	chmod 644 $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/phonegallery.svg
+	cp -f gallery/phonegallery-android $(DESTDIR)$(PREFIX)/bin
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/phonegallery-android
+	cp -f gallery/phonegallery-android-apply $(DESTDIR)$(PREFIX)/bin
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/phonegallery-android-apply
+	mkdir -p $(DESTDIR)/etc/systemd/user/default.target.wants
+	cp -f gallery/phonegallery-android.service $(DESTDIR)/etc/systemd/user
+	cp -f gallery/phonegallery-android-refresh.service gallery/phonegallery-android-refresh.timer $(DESTDIR)/etc/systemd/user
+	mkdir -p $(DESTDIR)/etc/systemd/user/timers.target.wants
+	ln -sf /etc/systemd/user/phonegallery-android-refresh.timer $(DESTDIR)/etc/systemd/user/timers.target.wants/phonegallery-android-refresh.timer
+	ln -sf /etc/systemd/user/phonegallery-android.service $(DESTDIR)/etc/systemd/user/default.target.wants/phonegallery-android.service
+	mkdir -p $(DESTDIR)/etc/sudoers.d
+	printf '%%wheel ALL=(root) NOPASSWD: $(PREFIX)/bin/phonegallery-android\n' > $(DESTDIR)/etc/sudoers.d/phonegallery-android
+	chmod 440 $(DESTDIR)/etc/sudoers.d/phonegallery-android
 	cp -f keyboard/phonekbd keyboard/phonekbd-lang $(DESTDIR)$(PREFIX)/bin
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/phonekbd $(DESTDIR)$(PREFIX)/bin/phonekbd-lang
+	cp -f waydroid/phone-waydroid-idle $(DESTDIR)$(PREFIX)/bin
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/phone-waydroid-idle
+	mkdir -p $(DESTDIR)/etc/systemd/user
+	cp -f waydroid/phone-waydroid-idle.service waydroid/phone-waydroid-idle.timer $(DESTDIR)/etc/systemd/user
+	mkdir -p $(DESTDIR)/etc/systemd/user/timers.target.wants
+	ln -sf /etc/systemd/user/phone-waydroid-idle.timer $(DESTDIR)/etc/systemd/user/timers.target.wants/phone-waydroid-idle.timer
+	mkdir -p $(DESTDIR)$(DATADIR)/phonegluewc/android
+	cp -f keyboard/android/phonekbd-bridge.apk $(DESTDIR)$(DATADIR)/phonegluewc/android
+	chmod 644 $(DESTDIR)$(DATADIR)/phonegluewc/android/phonekbd-bridge.apk
 	mkdir -p $(DESTDIR)$(DATADIR)/phonegluewc/keyboard
 	cp -f keyboard/data/words.tsv keyboard/data/bigrams.tsv keyboard/data/emoji.tsv keyboard/data/SOURCES keyboard/data/LICENSE-UNICODE $(DESTDIR)$(DATADIR)/phonegluewc/keyboard
 	cp -f screentext/phonetext screentext/phonetext-translate $(DESTDIR)$(PREFIX)/bin
@@ -180,8 +204,12 @@ install: phonegluewc phonegluewc-msg phonecamera phonepin keyboard/phonekbd scre
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/phonegluewc $(DESTDIR)$(PREFIX)/bin/phonegluewc-session $(DESTDIR)$(PREFIX)/bin/phonegluewc-sensor \
 		$(DESTDIR)$(PREFIX)/bin/phonegluewc-msg $(DESTDIR)$(PREFIX)/bin/phonecamera $(DESTDIR)$(PREFIX)/bin/phonepin $(DESTDIR)$(PREFIX)/bin/phonegluewc-hyprctl \
-		$(DESTDIR)$(PREFIX)/bin/phonekbd $(DESTDIR)$(PREFIX)/bin/phonekbd-lang $(DESTDIR)$(PREFIX)/bin/phonetext $(DESTDIR)$(PREFIX)/bin/phonetext-translate \
+		$(DESTDIR)$(PREFIX)/bin/phonekbd $(DESTDIR)$(PREFIX)/bin/phonekbd-lang $(DESTDIR)$(PREFIX)/bin/phone-waydroid-idle \
+		$(DESTDIR)/etc/systemd/user/phone-waydroid-idle.service $(DESTDIR)/etc/systemd/user/phone-waydroid-idle.timer $(DESTDIR)/etc/systemd/user/timers.target.wants/phone-waydroid-idle.timer $(DESTDIR)$(PREFIX)/bin/phonetext $(DESTDIR)$(PREFIX)/bin/phonetext-translate \
 		$(DESTDIR)$(PREFIX)/bin/phonesettings $(DESTDIR)$(DATADIR)/applications/phonesettings.desktop \
+		$(DESTDIR)$(PREFIX)/bin/phonegallery-android $(DESTDIR)/etc/sudoers.d/phonegallery-android \
+		$(DESTDIR)$(PREFIX)/bin/phonegallery-android-apply $(DESTDIR)/etc/systemd/user/phonegallery-android.service $(DESTDIR)/etc/systemd/user/default.target.wants/phonegallery-android.service \
+		$(DESTDIR)/etc/systemd/user/phonegallery-android-refresh.service $(DESTDIR)/etc/systemd/user/phonegallery-android-refresh.timer $(DESTDIR)/etc/systemd/user/timers.target.wants/phonegallery-android-refresh.timer \
 		$(DESTDIR)$(PREFIX)/bin/phonegallery $(DESTDIR)$(DATADIR)/applications/phonegallery.desktop \
 		$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/phonegallery.svg \
 		$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/phonesettings.svg \
@@ -189,7 +217,8 @@ uninstall:
 		$(DESTDIR)$(DATADIR)/phonegluewc/config.def.conf \
 		$(DESTDIR)$(SESSIONDIR)/phonegluewc.desktop
 	rm -rf $(DESTDIR)$(DATADIR)/doc/phonegluewc $(DESTDIR)$(PREFIX)/lib/phonegluewc $(DESTDIR)$(DATADIR)/phonegluewc/keyboard \
-		$(DESTDIR)$(DATADIR)/phonegluewc/settings $(DESTDIR)$(DATADIR)/phonegluewc/gallery $(DESTDIR)$(DATADIR)/phonegluewc/wallpapers
+		$(DESTDIR)$(DATADIR)/phonegluewc/settings $(DESTDIR)$(DATADIR)/phonegluewc/gallery $(DESTDIR)$(DATADIR)/phonegluewc/wallpapers \
+		$(DESTDIR)$(DATADIR)/phonegluewc/android
 
 .PHONY: all check clean dist install uninstall FORCE
 

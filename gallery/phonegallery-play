@@ -1,5 +1,7 @@
 #!/usr/bin/python3 -I
-"""phonegallery-play CLIP.mp4: plays one camera clip full screen. Tap pauses, the end or a closed window stops it."""
+"""phonegallery-play CLIP.mp4: plays one camera clip full screen with play/pause, seek bar, time and mute."""
+import os
+import signal
 import sys
 import gi
 gi.require_version("Gtk", "4.0")
@@ -7,20 +9,150 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Gst, Gio, GLib
 
 Gst.init(None)
+DEBUG = bool(os.environ.get("PHONEGALLERY_DEBUG"))
+# the hardware decoders (qcom-iris) can take the whole phone down: nothing may auto-pick them
+for f in Gst.Registry.get().get_feature_list(Gst.ElementFactory):
+    if f.get_name().startswith("v4l2"):
+        f.set_rank(Gst.Rank.NONE)
+
+CSS = b"""
+window { background: black; }
+.fade { transition: opacity 180ms ease; }
+.fade.off { opacity: 0; }
+.scrim-top { background-image: linear-gradient(to bottom, rgba(0,0,0,.62), rgba(0,0,0,0)); padding: 10px 14px 44px 14px; }
+.scrim-bottom { background-image: linear-gradient(to top, rgba(0,0,0,.68), rgba(0,0,0,0)); padding: 64px 30px 34px 30px; }
+.time { color: rgba(255,255,255,.86); font-size: 13px; font-weight: 300; font-feature-settings: "tnum"; }
+.hint { color: rgba(255,255,255,.9); font-size: 15px; font-weight: 300; padding: 8px 14px; }
+.msg { color: rgba(255,255,255,.9); font-size: 17px; font-weight: 300; padding: 28px; }
+"""
+
+LINE = 2.8  # one stroke weight for every glyph
+
+
+def glyph(cr, name, cx, cy, size, alpha=1.0):
+    """thin line icons on a 24 unit grid, centred on cx, cy"""
+    u = size / 24.0
+    cr.save()
+    cr.translate(cx - size / 2, cy - size / 2)
+    cr.scale(u, u)
+    cr.set_source_rgba(1, 1, 1, alpha)
+    cr.set_line_width(LINE * (24.0 / size) if size > 40 else LINE)
+    cr.set_line_cap(1)
+    cr.set_line_join(1)
+    if name == "back":
+        cr.move_to(15, 4); cr.line_to(7, 12); cr.line_to(15, 20)
+    elif name == "play":
+        cr.move_to(7, 3.5); cr.line_to(20, 12); cr.line_to(7, 20.5); cr.close_path()
+    elif name == "pause":
+        cr.move_to(8, 4); cr.line_to(8, 20); cr.move_to(16, 4); cr.line_to(16, 20)
+    elif name in ("sound", "muted"):
+        cr.move_to(3, 9); cr.line_to(7, 9); cr.line_to(12, 4.5); cr.line_to(12, 19.5); cr.line_to(7, 15); cr.line_to(3, 15); cr.close_path()
+        if name == "sound":
+            cr.stroke()
+            cr.new_sub_path(); cr.arc(12, 12, 5, -0.9, 0.9)
+            cr.stroke()
+            cr.new_sub_path(); cr.arc(12, 12, 9, -0.8, 0.8)
+        else:
+            cr.stroke()
+            cr.move_to(16, 9); cr.line_to(22, 15); cr.move_to(22, 9); cr.line_to(16, 15)
+    cr.stroke()
+    cr.restore()
+
+
+class Icon(Gtk.DrawingArea):
+    """a glyph with a generous touch target and nothing drawn behind it"""
+
+    def __init__(self, name, size, target, on_tap, align=Gtk.Align.CENTER):
+        super().__init__(halign=align, valign=Gtk.Align.CENTER)
+        self.name, self.size = name, size
+        self.set_content_width(target)
+        self.set_content_height(target)
+        self.set_draw_func(lambda _a, cr, w, h: glyph(cr, self.name, w / 2, h / 2, self.size))
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda g, *_: g.set_state(Gtk.EventSequenceState.CLAIMED))  # the picture's tap must not toggle the bars too
+        click.connect("released", lambda *_: on_tap())
+        self.add_controller(click)
+
+    def set_icon(self, name):
+        self.name = name
+        self.queue_draw()
+
+
+class Bar(Gtk.DrawingArea):
+    """a thin line with a small round handle that grows under the finger"""
+
+    def __init__(self, on_seek):
+        super().__init__(hexpand=True)
+        self.value, self.on_seek, self.x0, self.r, self.want = 0.0, on_seek, 0.0, 5.0, 5.0
+        self.set_content_height(44)
+        self.set_draw_func(self.draw)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.begin)
+        drag.connect("drag-update", lambda _g, dx, _dy: self.move(self.x0 + dx, False))
+        drag.connect("drag-end", self.end)
+        self.add_controller(drag)
+        self.add_tick_callback(self.tick)
+
+    def tick(self, _w, _clock):
+        if abs(self.r - self.want) > 0.05:
+            self.r += (self.want - self.r) * 0.35
+            self.queue_draw()
+        return True
+
+    def begin(self, g, x, _y):
+        g.set_state(Gtk.EventSequenceState.CLAIMED)
+        self.x0, self.want = x, 11.0
+        self.move(x, False)
+
+    def end(self, _g, dx, _dy):
+        self.want = 5.0
+        self.move(self.x0 + dx, True)
+
+    def move(self, x, final):
+        self.value = min(1.0, max(0.0, (x - 12) / max(1, self.get_width() - 24)))
+        self.queue_draw()
+        self.on_seek(self.value, final)
+
+    def set_value(self, v):
+        self.value = v
+        self.queue_draw()
+
+    def draw(self, _a, cr, w, h):
+        y, x0, x1 = h / 2, 12, w - 12
+        cx = x0 + (x1 - x0) * self.value
+        cr.set_line_width(2.2)
+        cr.set_source_rgba(1, 1, 1, .28)
+        cr.set_line_cap(0)  # square ends: no dot at the far end of the track
+        cr.move_to(x0, y); cr.line_to(x1, y); cr.stroke()
+        cr.set_line_cap(1)
+        cr.set_source_rgba(1, 1, 1, .95)
+        cr.move_to(x0, y); cr.line_to(cx, y); cr.stroke()
+        cr.arc(cx, y, self.r, 0, 6.2832)
+        cr.fill()
+
+
+def clock(ns):
+    s = max(0, int(ns // Gst.SECOND))
+    return f"{s // 60}:{s % 60:02d}"
 
 
 def pipeline(path):
-    # the decoder is named, never auto-picked: the hardware one (qcom-iris) can take the whole phone down
-    desc = (f'filesrc location="{path}" ! qtdemux name=d d.video_0 ! queue ! h264parse ! openh264dec'
-            " ! videoflip video-direction=auto ! videoconvert ! gtk4paintablesink name=sink")
-    p = Gst.parse_launch(desc)
-    # sound only when the clip has it; the pad shows up while the file is being read
-    def pad(demux, new):
+    # the decoder is named, never auto-picked. Sound is attached when the demuxer finds an audio track:
+    # a sink with no data would stop a silent clip from ever starting
+    p = Gst.parse_launch(f'filesrc location="{path}" ! qtdemux name=d d.video_0 ! queue ! h264parse ! openh264dec'
+                         " ! videoflip video-direction=auto ! videoconvert ! gtk4paintablesink name=sink")
+
+    def pad(_d, new):
         if new.get_name().startswith("audio"):
-            tail = Gst.parse_bin_from_description("queue ! decodebin ! audioconvert ! audioresample ! autoaudiosink", True)
-            p.add(tail)
-            tail.sync_state_with_parent()
-            new.link(tail.get_static_pad("sink"))
+            els = [Gst.ElementFactory.make(n, None) for n in ("queue", "fdkaacdec", "audioconvert", "audioresample", "volume", "autoaudiosink")]
+            els[4].set_property("name", "vol")
+            for e in els:
+                p.add(e)
+            for x, y in zip(els, els[1:]):
+                x.link(y)
+            for e in els:
+                e.sync_state_with_parent()
+            new.link(els[0].get_static_pad("sink"))
     p.get_by_name("d").connect("pad-added", pad)
     return p
 
@@ -31,35 +163,178 @@ def main(path):
     def activate(a):
         win = Gtk.ApplicationWindow(application=a, title="Video")
         css = Gtk.CssProvider()
-        css.load_from_data(b"window { background: black; }")
+        css.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_display(win.get_display(), css, 800)
         try:
             p = pipeline(path)
         except GLib.Error as e:
             sys.exit(f"phonegallery-play: {e.message}")
-        win.set_child(Gtk.Picture(paintable=p.get_by_name("sink").props.paintable))
-        playing = [True]
+        d = p.get_by_name("d")
+        st = dict(playing=True, dur=0, ended=False, failed=False, drag=False, seek_t=0.0, single=0)
 
-        def tap(*_):
-            playing[0] = not playing[0]
-            p.set_state(Gst.State.PLAYING if playing[0] else Gst.State.PAUSED)
+        over = Gtk.Overlay(child=Gtk.Picture(paintable=p.get_by_name("sink").props.paintable))
+        win.set_child(over)
+        msg = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, visible=False)
+        msg.add_css_class("msg")
+        over.add_overlay(msg)
+        # +10 s / -10 s flash at the side that was double tapped
+        flash = Gtk.Label(valign=Gtk.Align.CENTER, visible=False)
+        flash.add_css_class("hint")
+        over.add_overlay(flash)
+
+        top = Gtk.Box(halign=Gtk.Align.FILL, valign=Gtk.Align.START)
+        top.add_css_class("scrim-top")
+        top.add_css_class("fade")
+        close = Icon("back", 26, 56, lambda: stop(), Gtk.Align.START)
+        mute = Icon("sound", 26, 56, lambda: toggle_mute(), Gtk.Align.END)
+        mute.set_hexpand(True)
+        mute.set_visible(False)
+        top.append(close)
+        top.append(mute)
+        over.add_overlay(top)
+
+        centre = Icon("pause", 64, 120, lambda: play(not st["playing"]))
+        centre.add_css_class("fade")
+        centre.set_valign(Gtk.Align.CENTER)
+        over.add_overlay(centre)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, halign=Gtk.Align.FILL, valign=Gtk.Align.END)
+        bar.add_css_class("scrim-bottom")
+        bar.add_css_class("fade")
+        times = Gtk.Box(margin_start=12, margin_end=12)  # the labels line up with the ends of the line
+        now, total = Gtk.Label(label="0:00", xalign=0, hexpand=True), Gtk.Label(label="0:00", xalign=1)
+        for w in (now, total):
+            w.add_css_class("time")
+            times.append(w)
+        seek = Bar(lambda v, final: on_seek(v, final))
+        bar.append(times)
+        bar.append(seek)
+        over.add_overlay(bar)
+        chrome = (top, centre, bar)
+        hide = [0]
+
+        def show_bars(on=True):
+            for w in chrome:
+                (w.remove_css_class if on else w.add_css_class)("off")
+                w.set_can_target(on)
+            if hide[0]:
+                GLib.source_remove(hide[0])
+                hide[0] = 0
+            if on and st["playing"] and not st["drag"]:
+                hide[0] = GLib.timeout_add(3000, lambda: (hide.__setitem__(0, 0), show_bars(False))[1] and False)
+
+        def play(on):
+            st["playing"] = on
+            if on and st["ended"]:
+                st["ended"] = False
+                p.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, 0)
+            p.set_state(Gst.State.PLAYING if on else Gst.State.PAUSED)
+            centre.set_icon("pause" if on else "play")
+            show_bars()
+
+        def tick():
+            if st["failed"]:
+                return False
+            ok, dur = p.query_duration(Gst.Format.TIME)
+            if ok and dur > 0:
+                st["dur"] = dur
+                total.set_label(clock(dur))
+            ok, pos = p.query_position(Gst.Format.TIME)
+            if ok and not st["drag"] and st["dur"]:
+                now.set_label(clock(pos))
+                seek.set_value(min(1.0, pos / st["dur"]))
+                if DEBUG:
+                    print(f"state={p.get_state(0)[1].value_nick} pos={pos / Gst.SECOND:.1f}s", file=sys.stderr, flush=True)
+            return True
+
+        def jump(ns):
+            ok, pos = p.query_position(Gst.Format.TIME)
+            if ok and st["dur"]:
+                st["ended"] = False
+                p.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(max(0, min(st["dur"] - 1, pos + ns))))
+
+        def on_seek(v, final):
+            if not st["dur"]:
+                return
+            st["drag"] = not final
+            now.set_label(clock(v * st["dur"]))
+            t = GLib.get_monotonic_time() / 1e6
+            if final or t - st["seek_t"] > 0.12:  # the picture follows the finger, not every touch event
+                st["seek_t"] = t
+                p.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(v * st["dur"]))
+            if final:
+                st["ended"] = False
+            show_bars()
+
+        def toggle_mute():
+            vol = p.get_by_name("vol")
+            if vol:
+                vol.props.mute = not vol.props.mute
+                mute.set_icon("muted" if vol.props.mute else "sound")
+            show_bars()
 
         def stop(*_):
             p.set_state(Gst.State.NULL)
             a.quit()
 
+        def eos(*_):
+            st["ended"], st["playing"] = True, False
+            p.set_state(Gst.State.PAUSED)
+            centre.set_icon("play")
+            seek.set_value(1.0)
+            show_bars()
+
+        def error(_b, m):
+            err, dbg = m.parse_error()
+            print(f"phonegallery-play: {err.message} {dbg or ''}", file=sys.stderr)
+            st["failed"] = True
+            p.set_state(Gst.State.NULL)
+            bar.set_visible(False)
+            centre.set_visible(False)
+            msg.set_label("This video can't be played.\nThe file is damaged or was never finished.")
+            msg.set_visible(True)
+            show_bars()
+
+        def audio_pad(_d, pad):
+            if pad.get_name().startswith("audio"):
+                mute.set_visible(True)
+
+        def tapped(g, n, x, _y):
+            if st["failed"]:
+                return
+            if st["single"]:
+                GLib.source_remove(st["single"])
+                st["single"] = 0
+            if n >= 2:  # double tap: ten seconds back on the left half, forward on the right
+                left = x < over.get_width() / 2
+                jump(-10 * Gst.SECOND if left else 10 * Gst.SECOND)
+                flash.set_label("-10 s" if left else "+10 s")
+                flash.set_halign(Gtk.Align.START if left else Gtk.Align.END)
+                flash.set_margin_start(40)
+                flash.set_margin_end(40)
+                flash.set_visible(True)
+                GLib.timeout_add(700, lambda: flash.set_visible(False) or False)
+                return
+            st["single"] = GLib.timeout_add(260, lambda: (st.__setitem__("single", 0), show_bars(top.has_css_class("off")))[1] and False)
+
+        d.connect("pad-added", audio_pad)
         click = Gtk.GestureClick()
-        click.connect("released", tap)
-        win.add_controller(click)
+        click.connect("released", tapped)
+        over.add_controller(click)
         bus = p.get_bus()
         bus.add_signal_watch()
-        bus.connect("message::eos", stop)
-        bus.connect("message::error", stop)
+        bus.connect("message::eos", eos)
+        bus.connect("message::error", error)
         win.connect("close-request", stop)
         # covered or screen off: nothing keeps decoding
-        win.connect("notify::suspended", lambda w, _: w.props.suspended and playing[0] and tap())
+        win.connect("notify::suspended", lambda w, _: w.props.suspended and st["playing"] and play(False))
+        if DEBUG:  # test hooks: USR1 plays or pauses, USR2 shows or hides the controls
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda: (play(not st["playing"]), True)[1])
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, lambda: (show_bars(top.has_css_class("off")), True)[1])
         win.present()
         p.set_state(Gst.State.PLAYING)
+        GLib.timeout_add(200, tick)
+        show_bars()
 
     app.connect("activate", activate)
     return app.run([sys.argv[0]])
@@ -68,4 +343,5 @@ def main(path):
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__.strip())
+    assert clock(0) == "0:00" and clock(75 * Gst.SECOND) == "1:15"
     sys.exit(main(sys.argv[1]))
