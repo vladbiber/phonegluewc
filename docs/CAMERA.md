@@ -72,3 +72,6 @@ FILTER says how much is done to a retro photo after the shutter:
   moved to the brightness and colour of the viewfinder frame taken with it (`phonecamretro.match`), then the look.
 - FULL: developed from the raw frames with the developer's own colour, then the look. Colours can differ from
   the viewfinder, which shows the camera driver's own processing.
+
+PRO has the same instant path: CAPTURE set to RAW saves the viewfinder frame (3 MP, with the zoom, aspect, filter
+and turn of the screen) the moment the shutter is pressed, without stopping the sensor. No DNG and no stacking there.

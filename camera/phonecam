@@ -115,8 +115,9 @@ ONOFF = [("OFF", False), ("ON", True)]
 ROWS = [
     ("size", "RESOLUTION", "", [(m[0], i) for i, m in enumerate(CAMERAS[0][4])], "pro"),
     ("aspect", "ASPECT", "1.43 and 1.90 are the IMAX frames", [(n, n) for n, _ in lib.ASPECTS], "pro"),
-    ("stack", "CAPTURE", "Instant: one frame, no waiting. Stacked: hold still, frames merge against noise. Auto: stacks only in low light", [("INSTANT", "INSTANT"), ("AUTO", "AUTO"), ("STACKED", "STACKED")], "pro"),
-    ("dng", "RAW", "Keeps a DNG next to the JPEG", [("OFF", False), ("DNG", True)], "pro"),
+    ("stack", "CAPTURE", "Raw: the frame on the screen as it is, 3 MP, saved at once. Instant: one sensor frame, developed. Stacked: hold still, frames merge against noise. Auto: stacks only in low light",
+     [("RAW", "RAW"), ("INSTANT", "INSTANT"), ("AUTO", "AUTO"), ("STACKED", "STACKED")], "pro"),
+    ("dng", "DNG FILE", "Keeps the sensor data next to the JPEG (not with Raw capture)", [("OFF", False), ("DNG", True)], "pro"),
     ("anon", "ANONYMOUS", "Photos, RAW and videos are saved without camera, time, place or software details and with a random file name",
      ONOFF, "pro video retro"),
     ("timer", "TIMER", "", [("OFF", 0), ("3 S", 3), ("10 S", 10)], "pro retro"),
@@ -2126,29 +2127,50 @@ class Cam(Gtk.ApplicationWindow):
         return False
 
     def snap_live(self, lit=False):
-        """Raw: the frame on the screen is the photo, with nothing developed afterwards"""
+        """Raw (retro filter, pro capture): the frame on the screen is the photo, with nothing developed afterwards"""
         if self.S["flash"] == "FLASH" and self.cam[0] == "back" and not lit:
             self.set_led(True)
             return GLib.timeout_add(900, lambda: self.snap_live(True) and False)  # the exposure takes the light in
         if lit:
             self.set_led(False)
-        if not self.rframe:
-            return
-        data, w, h = self.rframe
+        if self.retro:
+            if not self.rframe:
+                return
+            data, w, h = self.rframe
+            img = np.frombuffer(data, np.uint8).reshape(h, w, 4)[:, :, :3]
+        else:  # pro: the camera frame, cut, tinted and turned the way the viewfinder shows it
+            if not self.frame:
+                return
+            data, w, h, fmt = self.frame
+            arr = np.frombuffer(data, np.uint8)
+            img = arr[:h * (arr.size // h)].reshape(h, arr.size // h)[:, :w * 4].reshape(h, w, 4)[:, :, :3]
+            rgb = img[:, :, ::-1] if fmt.startswith("BGR") else img
+            cw, ch = int(w / self.finder.zoom), int(h / self.finder.zoom)
+            if self.S["aspect"] != "4:3":
+                cw, ch = (int(v) for v in lib.crop_aspect(cw, ch, dict(lib.ASPECTS)[self.S["aspect"]]))
+            rgb = rgb[(h - ch) // 2:(h + ch) // 2, (w - cw) // 2:(w + cw) // 2]
+            m = self.view_matrix()
+            if m:
+                rgb = np.clip(cv2.transform(rgb.astype(np.float32) / 255, np.array(m, np.float32)) * 255, 0, 255).astype(np.uint8)
+            name, _p, rot, _mirror, _m = self.cam
+            turn = (rot - self.theta if name == "back" else rot + self.theta) % 360
+            img = np.ascontiguousarray(rgb[:, :, ::-1])
+            if turn:
+                img = cv2.rotate(img, {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}[turn])
         self.flash.add_css_class("on")
         GLib.timeout_add(70, lambda: self.flash.remove_css_class("on") or False)
         os.makedirs(PICS, exist_ok=True)
         path = output_name(time.time(), self.S["anon"])
         while os.path.exists(path):  # several within one second
             path = path[:-4] + "_1.jpg"
-        if not cv2.imwrite(path, np.frombuffer(data, np.uint8).reshape(h, w, 4)[:, :, :3], [cv2.IMWRITE_JPEG_QUALITY, 92]):
+        if not cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 92 if self.retro else 95]):
             return self.shot_failed("Cannot save the photo")
         self.pending += 1
         self.developed(path, None)
 
     def capture(self):
         S = self.S
-        if self.retro and S["rproc"] == "RAW":
+        if self.retro and S["rproc"] == "RAW" or S["mode"] == "pro" and S["stack"] == "RAW":
             return self.snap_live()
         name, _p, rot, _mirror, modes = self.cam
         _, mode, frames, size = modes[min(S["size"], len(modes) - 1)]
