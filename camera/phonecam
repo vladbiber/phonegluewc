@@ -126,7 +126,7 @@ ROWS = [
     ("rcap", "CAPTURE", "", [("PHOTO", "PHOTO"), ("VIDEO", "VIDEO")], "retro"),
     ("rsize", "PHOTO SIZE", "Old cameras were small: VGA is 640 x 480. Clips are always VGA", [(k, k) for k in retro.SIZES], "retro"),
     ("stamp", "DATE STAMP", "", ONOFF, "retro"),
-    ("osd", "SCREEN INFO", "Battery, shots left, date and time on the screen only, never in the picture. DISP switches it too", ONOFF, "retro"),
+    ("osd", "SCREEN INFO", "Battery, shots left, date and time on the screen (never in the picture) and the tiles under it. DISP switches it too", ONOFF, "retro"),
     ("volkeys", "VOLUME KEYS", "Volume up takes the picture, volume down zooms", ONOFF, "pro video retro"),
     ("haptic", "BUTTON FEEL", "The buttons of the old camera click under the finger", ONOFF, "retro"),
     ("vres", "RESOLUTION", "H.264 in MP4", [(k, k) for k in VIDEO], "video"),
@@ -1080,7 +1080,7 @@ class Cam(Gtk.ApplicationWindow):
 
     def params(self):
         if self.retro:  # what the photographer can turn on top of the style
-            return list(RADJ)
+            return ["iso"] + list(RADJ)
         p = ["fps", "angle"] if self.S["mode"] == "video" else ["shutter"]
         p += ["iso"] + (["ev"] if self.S["mode"] == "pro" else []) + ["wb", "tint"]
         return p + (["focus"] if self.lens_ok() else [])
@@ -1100,7 +1100,7 @@ class Cam(Gtk.ApplicationWindow):
             b.connect("clicked", lambda _b, k=k: self.select(None if self.param == k else k))
             self.tiles_box.append(b)
             self.tiles[k] = (b, val)
-        self.tiles_box.set_visible(bool(self.tiles))
+        self.tiles_box.set_visible(bool(self.tiles) and (not self.retro or self.S["osd"]))
 
     def next_choice(self, k):
         """a button of the old camera: each press takes the next choice"""
@@ -1253,6 +1253,9 @@ class Cam(Gtk.ApplicationWindow):
             self.push_controls()
         elif key == "rcap":
             self.shutter_art.queue_draw()
+        elif key == "osd":  # DISP clears the screen: the information and the tiles go together
+            self.select(None)
+            self.tiles_box.set_visible(bool(self.tiles) and value)
         self.refresh()
         self.save()
 
@@ -1278,6 +1281,8 @@ class Cam(Gtk.ApplicationWindow):
         look = LOOKS["STANDARD"]
         if S["mode"] == "pro":
             us, gain = S["shutter"], S["iso"]
+        elif self.retro:
+            gain = S["iso"]
         elif S["mode"] == "video":
             us, gain, look = S["angle"] and lib.shutter_us(S["angle"], self.fps), S["iso"], LOOKS[S["look"]]
             if self.locked:
@@ -1940,7 +1945,7 @@ class Cam(Gtk.ApplicationWindow):
         """what the automatic exposure chose, for the tiles and for locking"""
         while not self.quit:
             time.sleep(1)
-            if TESTSRC or not self.pipe or self.busy or not self.manual:
+            if TESTSRC or not self.pipe or self.busy:
                 continue
             try:
                 out = subprocess.run([os.path.join(BIN, "phonecam-raw"), "--viewfinder", self.cam[0]], check=True,
@@ -2134,7 +2139,7 @@ class Cam(Gtk.ApplicationWindow):
             dev += ["--matrix", ",".join(f"{v:.5f}" for r in FILTERS[S["filter"]][1] for v in r)]
         if S["aspect"] != "4:3" and not self.retro:
             dev += ["--aspect", f"{dict(lib.ASPECTS)[S['aspect']]:.4f}"]
-        man = (None, None)
+        man = (None, S["iso"]) if self.retro else (None, None)
         if S["mode"] == "pro":
             man = (S["shutter"], S["iso"])
             if S["wb"]:

@@ -54,8 +54,10 @@ blue on DIGICAM, violet on VHS, lamps glow, grain comes up). Bright parts bend o
 of clipping, so a sky stays sky. The tiles under the screen (EXPO, COLOR, WARM, GRAIN, BLUR, GLOW) are the
 photographer's own corrections on top of the style, for the live picture, clips and photos alike.
 
-The retro screen is the back of a compact camera: DISP switches the screen information (battery, shots left,
-file number, date and time; never in the picture), MENU opens the settings, the round pad has STYLE in the
+The ISO tile sets the sensor gain by hand, as in PRO.
+
+The retro screen is the back of a compact camera: DISP clears the screen, the information (battery, shots left,
+file number, date and time; never in the picture) and the tiles under it, MENU opens the settings, the round pad has STYLE in the
 middle and ZOOM, LIGHT, TIMER, SIZE around it. Turned sideways the screen is on the left and the keys on the
 right. Buttons buzz at the press (BUTTON FEEL).
 
