@@ -3,12 +3,14 @@
                  [--ccm s5kjn1|none] [--sat F] [--black N] [--zoom Z] [--size LONG_EDGE]
                  [--meter X,Y] [--matrix 12 floats] [--wb RGAIN,BGAIN] [--ev STOPS] [--gain F]
                  [--aspect RATIO] [--dng OUT.dng] [--exif EXPOSURE_US,ISO]
+                 [--retro STYLE [--retro-size LONG_EDGE] [--stamp UNIXTIME] [--retro-adj EV,SAT,WARM,GRAIN,SOFT,GLOW]]
 
 --zoom crops the centre, --size scales the result to that long edge, --meter exposes for the point
 (0..1, sensor orientation), --matrix is a 3x4 row-major colour filter on 0..1 sRGB RGB (offset last).
 --wb fixes the white balance (default: grey world), --ev brightens by stops, --gain replaces the
 automatic exposure gain (1: sensor clipping is white), --aspect crops to long/short edge RATIO,
 --dng also writes the stacked Bayer data before any processing, --exif tags the files.
+--retro turns the result into an old camera's picture (phonecamretro.py), --stamp prints that date on it.
 
 Develops 10-bit CSI-2 packed frames (N back to back in RAW) into a JPEG:
 align + sum frames, defect pixel fix, black level, white balance, demosaic,
@@ -373,6 +375,11 @@ if __name__ == "__main__":
                   meter=fl("--meter"), matrix=fl("--matrix"), size=int(opts.get("--size", 0)),
                   wb=fl("--wb"), ev=float(opts.get("--ev", 0)), fixed_gain=float(opts.get("--gain", 0)),
                   aspect=float(opts.get("--aspect", 0)), dng=opts.get("--dng"), exif=fl("--exif"), anon="--anon" in opts)
+    if "--retro" in opts:  # the look carries its own softness and compression: saved clean on top of that
+        import phonecamretro
+        img = phonecamretro.still(img, opts["--retro"], int(opts.get("--retro-size", 640)),
+                                  float(opts["--stamp"]) if "--stamp" in opts else None,
+                                  dict(zip(phonecamretro.ADJ, fl("--retro-adj"))) if "--retro-adj" in opts else None)
     # 4:4:4 at 97: 4:2:0 at 93 left 16 px chroma squares and 8 px luma blocks in smooth dark areas
     if not cv2.imwrite(dst, img, [cv2.IMWRITE_JPEG_QUALITY, 97, cv2.IMWRITE_JPEG_SAMPLING_FACTOR,
                                   cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]):

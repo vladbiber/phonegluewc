@@ -1,6 +1,6 @@
 # Camera: QR codes
 
-In Photo mode the camera app scans the viewfinder about three times a second for a QR code, on a copy of the
+In Pro mode the camera app scans the viewfinder about three times a second for a QR code, on a copy of the
 frame shrunk to 800 px, in a thread of its own at low priority. It skips frames while a photo is taken, a
 countdown runs, the screen is off or the app is paused, and when QR CODES is off in the settings sheet (on by
 default, remembered in `~/.config/phonecam.json`). The decoder is OpenCV's `QRCodeDetector`, already installed for
@@ -20,3 +20,46 @@ Tests: `python3 camera/phonecamlib.py --selfcheck` (the parsing), `python3 camer
 OpenCV, so on the phone). `qrimg.py DIR` writes PNGs of test codes. Headless, `PHONECAM_TESTSRC=1
 PHONECAM_QRIMG=code.png PHONECAM_QR_DRY=log.txt` feeds the picture as the camera and writes the actions to
 `log.txt` instead of running them; `PHONECAM_DO="3 qrpill 4 qrbtn:OPEN"` taps the pill and a card button.
+
+# Camera: Retro mode
+
+The modes are PRO (the normal camera), VIDEO and RETRO. Retro turns the phone into an old camera: the picture is
+shrunk to that camera's size first and the look is built on the small picture, so softness, colour smear and
+compression blocks have the right scale. A colour filter on a 12 MP photo cannot do that.
+
+Styles (STYLE tile, or the settings sheet), all in `camera/phonecamretro.py` as one table of numbers:
+
+- DIGICAM: an early 2000s compact or phone. Loud colour, burnt highlights, bluish whites, oversharpened, JPEG blocks.
+- VHS: camcorder tape. Colour at a twentieth of the width and drawn to the right, sharpening halo, white that
+  stops short of white, line noise, the torn band at the bottom, time and date in the corner.
+- DREAM: hazy, milky blacks, little colour, glow around lights, heavy compression.
+- LIMINAL: yellowed and dim, dark corners, grain.
+- NIGHT: a flash photo in the dark. The LED fires by itself, blacks are crushed, shadows go blue.
+
+The same renderer runs on live frames (`retro_loop` in `phonecam`: camera frame in, 640 x 480 frame out, to the
+screen and to the encoder) and on the developed raw photo (`phonecam-develop --retro STYLE`), so the viewfinder,
+the clip and the photo agree. In the dark, live frames are averaged with the ones before and smoothed, and the
+black level rises: sensor noise becomes soft trails instead of a pattern of pixels. CAPTURE switches the shutter
+between photo and clip; PHOTO SIZE is VGA, 1 MP or 2 MP; clips are always VGA. DATE STAMP prints the time.
+
+Frames are turned upright for the way the phone is held before the look goes on (the stamp and the tape lines
+have a bottom), so a clip keeps the shape it started with and carries no rotation tag.
+
+Tests, on the phone (they need OpenCV): `python3 camera/phonecamretro.py --selfcheck`;
+`python3 camera/phonecamretro.py IN.jpg OUT.jpg VHS` tries a look on any picture;
+`PHONECAM_DO="mode:retro 5 set:rstyle=dream 3 shutter 8 set:rcap=video 1 shutter 6 shutter 3 quit"` drives the app.
+
+Day and night: each style has a `dark` set of numbers and moves toward it as the scene gets darker (dusk turns
+blue on DIGICAM, violet on VHS, lamps glow, grain comes up). Bright parts bend over under white (`knee`) instead
+of clipping, so a sky stays sky. The tiles under the screen (EXPO, COLOR, WARM, GRAIN, BLUR, GLOW) are the
+photographer's own corrections on top of the style, for the live picture, clips and photos alike.
+
+The retro screen is the back of a compact camera: DISP switches the screen information (battery, shots left,
+file number, date and time; never in the picture), MENU opens the settings, the round pad has STYLE in the
+middle and ZOOM, LIGHT, TIMER, SIZE around it. Turned sideways the screen is on the left and the keys on the
+right. Buttons buzz at the press (BUTTON FEEL).
+
+Volume keys: with the camera in front, volume up takes the picture (or starts and stops a clip) and volume down
+zooms, in every mode (VOLUME KEYS in the settings). The compositor keeps sending the keys as button events; the
+camera reads `~/.local/state/phonegluewc/button` itself and writes `1` to `camera-keys` next to it while it is
+the active window, which is when the shell leaves the volume alone.

@@ -31,6 +31,12 @@ WlSessionLock {
                 }
             }
         }
+        // the home's top bar, seen only: nothing here takes a touch
+        BarRow {
+            anchors { top: parent.top; left: parent.left; right: parent.right }
+            height: Status.barHeight
+            z: 1
+        }
         Loader {
             anchors.fill: parent
             active: Droid.call !== null

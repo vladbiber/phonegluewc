@@ -230,9 +230,9 @@ Singleton {
     }
     // a shell that starts locked still learns the volume and the torch once
     Component.onCompleted: if (Phone.lockOpen) refresh()
-    // nothing to see behind the lock, and fresh the moment it opens
+    // the lock shows the bar while the screen is lit; nothing to see once it is dark
     Timer {
-        running: !Phone.lockOpen
+        running: !Phone.lockOpen || !Phone.screenOff
         repeat: true
         triggeredOnStart: true
         interval: root.panelLoaded ? 3000 : 15000

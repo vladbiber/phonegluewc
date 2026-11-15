@@ -1,6 +1,6 @@
 #!/usr/bin/python3 -I
-"""phonecam: libcamera viewfinder with photo, video and pro modes; stills are raw frames developed by phonecam-develop."""
-import json, math, os, queue, shutil, subprocess, sys, threading, time
+"""phonecam: libcamera viewfinder with pro, video and retro modes; stills are raw frames developed by phonecam-develop."""
+import fcntl, glob, json, math, os, queue, shutil, struct, subprocess, sys, threading, time
 
 # libcamera's dma-heap allocations fail above 1080p; hide the heap so it falls back to udmabuf
 if os.path.isdir("/dev/dma_heap") and not os.environ.get("PHONECAM_BWRAP"):
@@ -13,6 +13,7 @@ sys.path.insert(0, BIN)
 import numpy as np
 import cv2
 import phonecamlib as lib
+import phonecamretro as retro
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gst", "1.0")
@@ -38,6 +39,8 @@ FPS_MAX = {"back": 30, "front": 24}  # what that mode delivers
 HANDHELD_US = 66000  # longer frames blur in hand; the rest of the exposure goes into gain
 DARK_GAIN = 8  # above this the frame count doubles: more frames instead of a longer, shakier exposure
 ZOOMS = (1, 2, 4)
+MODES = ("pro", "video", "retro")
+RETRO_KBIT = 3000
 TESTSRC = bool(os.environ.get("PHONECAM_TESTSRC"))  # UI tests without the room
 LENS = "/sys/module/camu_lens/parameters/pos"
 # Lens DAC codes. Unpowered, the lens rests far inside infinity and everything is blurred. This module's
@@ -59,6 +62,13 @@ QR_WIDTH = 800  # the scanned frame is this wide
 QR_GONE = 1.5  # the pill stays this long after the code left the frame
 QR_DRY = os.environ.get("PHONECAM_QR_DRY")  # test hook: actions are written to this file instead of run
 RED = (0.843, 0.098, 0.129)
+# the compositor's state files: hardware button presses arrive in "button"; "camera-keys" tells the shell
+# that the camera in front takes the volume keys
+STATE = os.path.join(GLib.get_user_state_dir(), "phonegluewc")
+# retro tiles: key -> (label, values, major tick, look parameter)
+RADJ = {"rev": ("EXPO", [round(i / 3, 2) for i in range(-6, 7)], 3, "ev"), "rsat": ("COLOR", [round(i / 10, 1) for i in range(0, 21)], 5, "sat"),
+        "rwarm": ("WARM", list(range(-12, 13)), 4, "warm"), "rgrain": ("GRAIN", [round(i / 4, 2) for i in range(0, 13)], 4, "grain"),
+        "rsoft": ("BLUR", [round(i / 4, 2) for i in range(0, 13)], 4, "soft"), "rglow": ("GLOW", [round(i / 4, 2) for i in range(0, 13)], 4, "glow")}
 
 
 def affine(*ops):
@@ -95,29 +105,38 @@ PICS = os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTU
                     or os.path.expanduser("~/Pictures"), "Camera")
 VIDS = PICS  # one camera roll: the gallery shows a single folder
 CONF = os.path.join(GLib.get_user_config_dir(), "phonecam.json")
-DEFAULTS = dict(qr=True, mode="photo", size=0, aspect="4:3", stack="AUTO", dng=False, anon=False, timer=0, filter=0, flash="OFF",
+DEFAULTS = dict(qr=True, mode="pro", rstyle="VHS", rcap="PHOTO", rsize="VGA", stamp=True, haptic=True, osd=True, volkeys=True,
+                rev=0.0, rsat=1.0, rwarm=0, rgrain=1.0, rsoft=1.0, rglow=1.0, size=0, aspect="4:3", stack="AUTO", dng=False, anon=False, timer=0, filter=0, flash="OFF",
                 grid=False, level=False, hist=True, zebra=0, peaking=False, falsecolor=False,
                 vres="1080P", fps=30, look="STANDARD", lock=False, vguide="OFF",
                 shutter=None, angle=None, iso=None, ev=0.0, wb=None, tint=0, focus=None)
 ONOFF = [("OFF", False), ("ON", True)]
 # settings sheet: key, title, hint, options, modes that show it
 ROWS = [
-    ("size", "RESOLUTION", "", [(m[0], i) for i, m in enumerate(CAMERAS[0][4])], "photo pro"),
-    ("aspect", "ASPECT", "1.43 and 1.90 are the IMAX frames", [(n, n) for n, _ in lib.ASPECTS], "photo pro"),
-    ("stack", "CAPTURE", "Instant: one frame, no waiting. Stacked: hold still, frames merge against noise. Auto: stacks only in low light", [("INSTANT", "INSTANT"), ("AUTO", "AUTO"), ("STACKED", "STACKED")], "photo pro"),
-    ("dng", "RAW", "Keeps a DNG next to the JPEG", [("OFF", False), ("DNG", True)], "photo pro"),
+    ("size", "RESOLUTION", "", [(m[0], i) for i, m in enumerate(CAMERAS[0][4])], "pro"),
+    ("aspect", "ASPECT", "1.43 and 1.90 are the IMAX frames", [(n, n) for n, _ in lib.ASPECTS], "pro"),
+    ("stack", "CAPTURE", "Instant: one frame, no waiting. Stacked: hold still, frames merge against noise. Auto: stacks only in low light", [("INSTANT", "INSTANT"), ("AUTO", "AUTO"), ("STACKED", "STACKED")], "pro"),
+    ("dng", "RAW", "Keeps a DNG next to the JPEG", [("OFF", False), ("DNG", True)], "pro"),
     ("anon", "ANONYMOUS", "Photos, RAW and videos are saved without camera, time, place or software details and with a random file name",
-     ONOFF, "photo video pro"),
-    ("timer", "TIMER", "", [("OFF", 0), ("3 S", 3), ("10 S", 10)], "photo pro"),
-    ("filter", "FILTER", "", [(n.upper(), i) for i, (n, _) in enumerate(FILTERS)], "photo pro"),
+     ONOFF, "pro video retro"),
+    ("timer", "TIMER", "", [("OFF", 0), ("3 S", 3), ("10 S", 10)], "pro retro"),
+    ("filter", "FILTER", "", [(n.upper(), i) for i, (n, _) in enumerate(FILTERS)], "pro"),
+    ("rstyle", "STYLE", "Digicam: an early 2000s compact, loud colours and burnt skies. VHS: camcorder tape. Dream: hazy and washed out. Liminal: yellowed, dim corners. Night: a flash photo in the dark",
+     [(k, k) for k in retro.STYLES], "retro"),
+    ("rcap", "CAPTURE", "", [("PHOTO", "PHOTO"), ("VIDEO", "VIDEO")], "retro"),
+    ("rsize", "PHOTO SIZE", "Old cameras were small: VGA is 640 x 480. Clips are always VGA", [(k, k) for k in retro.SIZES], "retro"),
+    ("stamp", "DATE STAMP", "", ONOFF, "retro"),
+    ("osd", "SCREEN INFO", "Battery, shots left, date and time on the screen only, never in the picture. DISP switches it too", ONOFF, "retro"),
+    ("volkeys", "VOLUME KEYS", "Volume up takes the picture, volume down zooms", ONOFF, "pro video retro"),
+    ("haptic", "BUTTON FEEL", "The buttons of the old camera click under the finger", ONOFF, "retro"),
     ("vres", "RESOLUTION", "H.264 in MP4", [(k, k) for k in VIDEO], "video"),
     ("look", "LOOK", "Flat keeps more room for grading", [(k, k) for k in LOOKS], "video"),
     ("vguide", "FRAME GUIDE", "Lines only, the full frame is recorded", [("OFF", "OFF")] + [(n, n) for n, _ in lib.ASPECTS[2:]], "video"),
     ("lock", "LOCK IN REC", "Shutter, ISO and white balance stay put while recording", ONOFF, "video"),
-    ("qr", "QR CODES", "A code in view shows a pill; nothing opens until you tap it", ONOFF, "photo"),
-    ("flash", "LIGHT", "", [("OFF", "OFF"), ("FLASH", "FLASH"), ("TORCH", "TORCH")], "photo video pro"),
-    ("grid", "GRID", "", ONOFF, "photo video pro"),
-    ("level", "LEVEL", "", ONOFF, "photo video pro"),
+    ("qr", "QR CODES", "A code in view shows a pill; nothing opens until you tap it", ONOFF, "pro"),
+    ("flash", "LIGHT", "", [("OFF", "OFF"), ("FLASH", "FLASH"), ("TORCH", "TORCH")], "pro video retro"),
+    ("grid", "GRID", "", ONOFF, "pro video retro"),
+    ("level", "LEVEL", "", ONOFF, "pro video retro"),
     ("hist", "HISTOGRAM", "", ONOFF, "video pro"),
     ("zebra", "ZEBRA", "Stripes on highlights at or above the level", [("OFF", 0), ("70%", 70), ("95%", 95)], "video pro"),
     ("peaking", "FOCUS PEAKING", "Red on sharp edges", ONOFF, "video pro"),
@@ -192,6 +211,39 @@ button { background: none; border: none; box-shadow: none; outline: none; color:
 .qrbody { font-size: 14px; color: white; }
 .qrbtn { min-height: 38px; padding: 0 16px; border-radius: 19px; background: #1c1c1c; font-size: 12px; font-weight: bold; }
 .qrbtn.main { background: white; color: black; }
+window.retro { background: linear-gradient(to bottom, #4d525e, #646a78 18%, #4a4e59 55%, #33363e); }
+.retro .panel { background: none; padding: 2px 0 14px 0; }
+.retro .lcd { margin: 44px 14px 8px 14px; border: 7px solid #060608; border-radius: 6px; background: black;
+              box-shadow: 0 0 0 2px #23252b, 0 0 0 3px #8b909c; }
+.land.retro .lcd { margin: 16px 6px 16px 46px; }
+.cbtn { min-width: 50px; min-height: 50px; border-radius: 50%; border: 2px solid #9197a4;
+        background: linear-gradient(to bottom, #737986, #454953 60%, #3a3d46);
+        box-shadow: 0 0 0 3px #26282e, 0 3px 5px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.35); transition: transform 60ms; }
+.cbtn:active { background: linear-gradient(to bottom, #33363e, #555a65); box-shadow: 0 0 0 3px #26282e, inset 0 2px 5px rgba(0,0,0,.7);
+               transform: translateY(1.5px); }
+.cbtn.big { min-width: 62px; min-height: 62px; }
+.dpad { border-radius: 50%; border: 2px solid #9197a4; padding: 3px;
+        background: linear-gradient(to bottom, #666c79, #3d4049); box-shadow: 0 0 0 4px #26282e, 0 3px 6px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.3); }
+.dir { min-width: 46px; min-height: 40px; border-radius: 14px; }
+.dir:active { background: rgba(0,0,0,.3); box-shadow: inset 0 2px 3px rgba(0,0,0,.5); }
+.slot { min-width: 96px; min-height: 28px; border-radius: 14px; border: 2px solid #9197a4; padding: 2px;
+        background: linear-gradient(to bottom, #1d1f24, #3a3d46); box-shadow: 0 0 0 3px #26282e, inset 0 2px 4px rgba(0,0,0,.8); }
+.knob { min-width: 44px; min-height: 22px; border-radius: 11px; border: 1px solid #5c606b;
+        background: linear-gradient(to bottom, #f4f5f8, #a9adb8); box-shadow: 0 1px 2px rgba(0,0,0,.6); }
+.retro .round { background: linear-gradient(to bottom, #737986, #3a3d46); border: 2px solid #9197a4;
+                box-shadow: 0 0 0 3px #26282e, 0 3px 5px rgba(0,0,0,.6); }
+.retro .round:active { box-shadow: 0 0 0 3px #26282e, inset 0 2px 5px rgba(0,0,0,.8); }
+.retro .shutter:active { transform: scale(.9); }
+.retro .tile.on { background: rgba(0,0,0,.35); }
+.land.retro .panel { padding: 16px 0 4px 0; }
+.land.retro .bar { padding-top: 0; }
+.land.retro .tile { padding: 2px 0; }
+.land .cbtn { min-width: 42px; min-height: 42px; }
+.land .cbtn.big { min-width: 52px; min-height: 52px; }
+.land .dir { min-width: 40px; min-height: 28px; }
+.land .switchrow { margin: 0; }
+.switchrow { margin: 10px 0 4px 0; }
+.retro .tname { color: #aeb3c0; }
 .close { min-height: 40px; border-radius: 20px; background: #1c1c1c; font-size: 11px; font-weight: bold; letter-spacing: 1.5px; }
 """
 
@@ -207,6 +259,32 @@ def dots(cr, text, x, y, pitch, rgb=(1, 1, 1), alpha=1.0):
                     cr.arc(x + (n * 6 + c + .5) * pitch, y + (r + .5) * pitch, pitch * .42, 0, 6.2832)
     cr.fill()
     return len(text) * 6 * pitch
+
+
+class Buzz:
+    """the phone's vibrator through evdev force feedback; nothing happens where there is none"""
+    fd, ids = None, {}
+
+    def play(self, ms):
+        try:
+            if self.fd is None:
+                self.fd = -1
+                for d in glob.glob("/sys/class/input/event*"):
+                    with open(d + "/device/name") as f:
+                        if "haptic" in f.read().lower():
+                            self.fd = os.open("/dev/input/" + os.path.basename(d), os.O_RDWR | os.O_NONBLOCK)
+            if self.fd < 0:
+                return
+            if ms not in self.ids:  # struct ff_effect: FF_RUMBLE, new id, replay length, strong magnitude
+                e = bytearray(struct.pack("HhHHHHH2xHH28x", 0x50, -1, 0, 0, 0, ms, 0, 0xc000, 0))
+                fcntl.ioctl(self.fd, 0x40304580, e)  # EVIOCSFF
+                self.ids[ms] = struct.unpack_from("h", e, 2)[0]
+            os.write(self.fd, struct.pack("qqHHi", 0, 0, 0x15, self.ids[ms], 1))  # EV_FF: play
+        except OSError:
+            self.fd = -1
+
+
+BUZZ = Buzz()
 
 
 def button(name_="", **kw):
@@ -300,6 +378,8 @@ class Finder(Gtk.Widget):
         self.rot, self.mirror, self.overlay = 270, False, None
         self.ring, self.ring_ok, self.aspect, self.grid, self.level = None, True, 0.0, False, None
         self.count, self.legend, self.inset = 0, False, 0
+        self.pre = None  # (turn, mirror) already done to the picture before it got here; zoom too
+        self.osd = None  # retro: what the old camera prints on its screen
 
     def set_paintable(self, p):
         if self.hid:
@@ -331,10 +411,14 @@ class Finder(Gtk.Widget):
         u, v = (x - fx) / dw, (y - fy) / dh
         if not (0 <= u <= 1 and 0 <= v <= 1):
             return None
+        back = lambda u, v, rot: {0: (u, v), 90: (v, 1 - u), 180: (1 - u, 1 - v), 270: (1 - v, u)}[rot]
+        rot, mirror = self.rot, self.mirror
+        if self.pre:
+            (u, v), (rot, mirror) = back(u, v, rot), self.pre
         u, v = .5 + (u - .5) / self.zoom, .5 + (v - .5) / self.zoom
-        if self.mirror:
+        if mirror:
             u = 1 - u
-        return {0: (u, v), 90: (v, 1 - u), 180: (1 - u, 1 - v), 270: (1 - v, u)}[self.rot]
+        return back(u, v, rot)
 
     def set_filter(self, m):
         # GSK multiplies the colour as a row vector: the 4x4 is our 3x4 transposed, offsets apart
@@ -351,7 +435,8 @@ class Finder(Gtk.Widget):
             sn.push_clip(Graphene.Rect().init(x, y, dw, dh))
             sn.save()
             sn.translate(Graphene.Point().init(x + dw / 2, y + dh / 2))
-            sn.scale(-self.zoom if self.mirror else self.zoom, self.zoom)
+            z = 1 if self.pre else self.zoom
+            sn.scale(-z if self.mirror else z, z)
             sn.rotate(self.rot)
             sn.translate(Graphene.Point().init(-pw / 2, -ph / 2))
             if self.matrix:
@@ -418,9 +503,50 @@ class Finder(Gtk.Widget):
                 cr.rectangle(x + n * seg, y + dh - 16, seg, 16)
                 cr.fill()
                 dots(cr, names[n], x + n * seg + 4, y + dh - 13, 1.4, (0, 0, 0) if rgb and n > 2 else (1, 1, 1))
+        if self.osd and dw > 150:
+            self.draw_osd(cr, x, y, dw, dh)
         if self.count:
             p = 9
             dots(cr, str(self.count), x + dw / 2 - len(str(self.count)) * 3 * p + p / 2, y + dh / 2 - 3.5 * p, p)
+
+
+    def draw_osd(self, cr, x, y, w, h):
+        """a compact camera's screen text: mode badge, battery, shots left, what is switched on"""
+        o, p, m = self.osd, 1.7, 9
+
+        def text(s, tx, ty, rgb=(1, 1, 1), right=False):
+            tx -= len(s) * 6 * p if right else 0
+            dots(cr, s, tx + 1.3, ty + 1.3, p, (0, 0, 0), .75)
+            dots(cr, s, tx, ty, p, rgb)
+            return len(s) * 6 * p
+        line = 7 * p + 9
+        bw = len(o["style"]) * 6 * p + 8
+        cr.set_source_rgba(1, 1, 1, .95)
+        cr.rectangle(x + m, y + m, bw, 7 * p + 8)
+        cr.fill()
+        dots(cr, o["style"], x + m + 5, y + m + 4, p, (0, 0, 0))
+        text(o["cap"], x + m + bw + 8, y + m + 4)
+        tw = text(o["left"], x + w - m, y + m + 4, right=True)
+        bx, by = x + w - m - tw - 34, y + m + 3  # battery: outline, nub, three bars
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_line_width(1.6)
+        cr.rectangle(bx, by, 24, 12)
+        cr.stroke()
+        cr.rectangle(bx - 3, by + 3.5, 3, 5)
+        for i in range(round(o["batt"] * 3)):
+            cr.rectangle(bx + 18 - i * 7, by + 2.5, 4.5, 7)
+        cr.fill()
+        if o["zoom"]:
+            text(o["zoom"], x + w - m, y + m + 4 + line, right=True)
+        if o["rec"]:
+            cr.set_source_rgb(*RED)
+            cr.arc(x + m + 6, y + m + 4 + line + 3.5 * p, 5, 0, 6.2832)
+            cr.fill()
+            text(o["rec"], x + m + 18, y + m + 4 + line)
+        if o["info"]:
+            text(o["info"], x + m, y + h - m - 7 * p)
+        text(o["date"], x + w - m, y + h - m - 7 * p, right=True)
+        text(o["file"], x + w - m, y + m + 4 + line * (2 if o["zoom"] else 1), right=True)
 
 
 class Cam(Gtk.ApplicationWindow):
@@ -430,7 +556,7 @@ class Cam(Gtk.ApplicationWindow):
         try:
             with open(CONF) as f:
                 self.S.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
-            for key, _t, _h, options, _m in ROWS + [("mode", "", "", [(m, m) for m in ("photo", "video", "pro")], "")]:
+            for key, _t, _h, options, _m in ROWS + [("mode", "", "", [(m, m) for m in MODES], "")]:
                 if self.S[key] not in [v for _l, v in options]:  # a choice that no longer exists
                     self.S[key] = DEFAULTS[key]
         except (OSError, ValueError):
@@ -467,6 +593,7 @@ class Cam(Gtk.ApplicationWindow):
         self.qr_in, self.qr_ev, self.qr_last = None, threading.Event(), 0.0
         self.qrimg = os.environ.get("PHONECAM_QRIMG")
         self.qr_info, self.qr_seen, self.qr_text = None, 0.0, None
+        self.rframe, self.rturn = None, 0  # retro: the last frame drawn, how far frames are turned before the look
 
         self.finder = Finder()
         self.finder.inset = 88
@@ -490,13 +617,13 @@ class Cam(Gtk.ApplicationWindow):
         self.light_icon = self.icon(self.draw_bolt)
         self.light = button(child=self.light_icon, css_classes=["icon"], name_="Light")
         self.light.connect("clicked", self.next_light)
-        top = Gtk.Box(spacing=8, css_classes=["topbar"], valign=Gtk.Align.START)
+        top = self.top = Gtk.Box(spacing=8, css_classes=["topbar"], valign=Gtk.Align.START)
         for wdg in (self.gear, pill, self.light):
             top.append(wdg)
         self.scope = Gtk.DrawingArea(content_width=112, content_height=58, halign=Gtk.Align.START, valign=Gtk.Align.START,
                                      margin_start=12, margin_top=92, can_target=False)
         self.scope.set_draw_func(self.draw_scope)
-        view = Gtk.Overlay(child=self.finder, hexpand=True, vexpand=True)
+        view = Gtk.Overlay(child=self.finder, hexpand=True, vexpand=True, css_classes=["lcd"])
         self.qrpill = button(css_classes=["qrpill"], halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=22,
                              visible=False, name_="QR code")
         self.qrpill.connect("clicked", self.qr_tapped)
@@ -527,7 +654,7 @@ class Cam(Gtk.ApplicationWindow):
             self.chips.append(c)
         self.modes = {}
         modes = Gtk.Box(halign=Gtk.Align.CENTER)
-        for m in ("photo", "video", "pro"):
+        for m in MODES:
             d = DotText(m, pitch=1.9)
             b = button(child=d, css_classes=["mode"], name_=m.capitalize() + " mode")
             b.connect("clicked", lambda _b, m=m: self.set_mode(m))
@@ -553,8 +680,39 @@ class Cam(Gtk.ApplicationWindow):
         bar.set_start_widget(self.thumb)
         bar.set_center_widget(self.shutter)
         bar.set_end_widget(self.flip)
+        # retro: the back of a compact camera. DISP and MENU, a round pad with STYLE in the middle, the photo/video switch
+        ink = (.84, .86, .9)
+
+        def key(text, name, fn, cls="cbtn", pitch=1.25):
+            b = button(child=DotText(text, pitch=pitch, rgb=ink, halign=Gtk.Align.CENTER), css_classes=cls.split(), name_=name,
+                       halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+            b.connect("clicked", lambda *_: fn())
+            self.phys(b)
+            return b
+        pad = Gtk.Grid(css_classes=["dpad"], halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        for text, name, fn, col, row in (
+                ("ZOOM", "Zoom", lambda: self.set_zoom({1: 2, 2: 4}.get(round(self.finder.zoom), 1)), 1, 0),
+                ("LIGHT", "Light", self.next_light, 0, 1), ("TIMER", "Timer", lambda: self.next_choice("timer"), 2, 1),
+                ("SIZE", "Photo size", lambda: self.next_choice("rsize"), 1, 2)):
+            pad.attach(key(text, name, fn, "dir", 1.1), col, row, 1, 1)
+        pad.attach(key("STYLE", "Style", lambda: self.next_choice("rstyle"), "cbtn big"), 1, 1, 1, 1)
+        self.keys = Gtk.Grid(halign=Gtk.Align.CENTER, column_spacing=26, row_spacing=12, margin_top=6)
+        self.body_keys = (key("DISP", "Screen info", lambda: self.next_choice("osd")), pad,
+                          key("MENU", "Settings", lambda: self.sheet_open(not self.sheet.get_reveal_child())))
+        self.knob = Gtk.Box(css_classes=["knob"], halign=Gtk.Align.START, valign=Gtk.Align.CENTER)
+        slot = button(child=self.knob, css_classes=["slot"], name_="Photo or video", valign=Gtk.Align.CENTER)
+        slot.connect("clicked", lambda *_: self.next_choice("rcap"))
+        self.phys(slot)
+        switch = self.switch_row = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER, css_classes=["switchrow"])
+        for wdg in (DotText("PHOTO", pitch=1.25, rgb=ink), slot, DotText("VIDEO", pitch=1.25, rgb=ink)):
+            switch.append(wdg)
+        self.cambody = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, visible=False)
+        self.cambody.append(self.keys)
+        self.cambody.append(switch)
+        for b, ms in [(self.shutter, 45), (self.flip, 18), (self.thumb, 18)] + [(b, 18) for b, _d in self.modes.values()]:
+            self.phys(b, ms)
         self.panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["panel"], valign=Gtk.Align.END)
-        for wdg in (self.tiles_box, self.zoom_box, modes, bar):
+        for wdg in (self.tiles_box, self.zoom_box, self.cambody, modes, bar):
             self.panel.append(wdg)
         self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.body.append(view)
@@ -576,6 +734,10 @@ class Cam(Gtk.ApplicationWindow):
         self.set_child(root)
 
         self.connect("close-request", self.on_close)
+        self.connect("notify::is-active", lambda *_: self.claim_keys())
+        self.btn_seq, self.btn_t = None, 0.0
+        self.btn_mon = Gio.File.new_for_path(os.path.join(STATE, "button")).monitor_file(Gio.FileMonitorFlags.NONE, None)
+        self.btn_mon.connect("changed", self.on_button)
         self.connect("notify::suspended", self.on_suspended)
         self.connect("realize", lambda *_: self.get_surface().connect("layout", self.on_layout))
         threading.Thread(target=self.developer, daemon=True).start()
@@ -586,6 +748,7 @@ class Cam(Gtk.ApplicationWindow):
             threading.Thread(target=self.gravity, daemon=True).start()
         GLib.timeout_add(1000, self.tick)
         GLib.timeout_add(300, self.qr_tick)
+        self.relayout()
         self.set_zoom(1)
         self.set_mode(self.S["mode"], first=True)
         GLib.timeout_add(1500, self.script, os.environ.get("PHONECAM_DO", "").split())
@@ -631,6 +794,12 @@ class Cam(Gtk.ApplicationWindow):
 
     # ---- small drawings: the icon theme here has none of these
 
+    def phys(self, b, ms=18):
+        """in retro the button answers the finger with a short buzz, at the press, as a real key does"""
+        g = Gtk.GestureClick(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        g.connect("pressed", lambda *_: self.retro and self.S["haptic"] and BUZZ.play(ms))
+        b.add_controller(g)
+
     @staticmethod
     def icon(draw, size=20):
         d = Gtk.DrawingArea(content_width=size, content_height=size, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
@@ -665,11 +834,27 @@ class Cam(Gtk.ApplicationWindow):
 
     def draw_shutter(self, _a, cr, w, h):
         """white ring; inside it a white disc for photos, a red one for video, a red square while recording"""
-        cr.set_source_rgb(1, 1, 1)
-        cr.set_line_width(3)
-        cr.arc(w / 2, h / 2, w / 2 - 2, 0, 6.2832)
-        cr.stroke()
-        if self.S["mode"] == "video":
+        if self.retro:  # a metal release button in its collar
+            import cairo
+            for r, top, bottom in ((w / 2 - 1, .45, .78), (w / 2 - 7, .97, .62)):
+                g = cairo.LinearGradient(0, h / 2 - r, 0, h / 2 + r)
+                g.add_color_stop_rgb(0, top, top, top + .02)
+                g.add_color_stop_rgb(1, bottom, bottom, bottom + .02)
+                cr.set_source(g)
+                cr.arc(w / 2, h / 2, r, 0, 6.2832)
+                cr.fill()
+            if not (self.filming or self.rec):
+                return
+            cr.set_source_rgb(*RED)
+            if not self.rec:
+                cr.arc(w / 2, h / 2, 7, 0, 6.2832)
+                return cr.fill()
+        else:
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_line_width(3)
+            cr.arc(w / 2, h / 2, w / 2 - 2, 0, 6.2832)
+            cr.stroke()
+        if self.filming:
             cr.set_source_rgb(*RED)
         if self.rec:
             r, k = 13, 5
@@ -734,6 +919,9 @@ class Cam(Gtk.ApplicationWindow):
         """the newest frame as a texture of our own. Never the sink's current image: that one holds a
         camera buffer, the buffer keeps libcamera's manager alive across a restart, and the camera then
         still calls into the pipeline that was just freed (libcamerasrc never disconnects) and crashes."""
+        if self.retro and self.rframe:
+            data, w, h = self.rframe
+            return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.B8G8R8A8, GLib.Bytes.new(data), w * 4)
         if not self.frame:
             return None
         data, w, h, fmt = self.frame
@@ -771,7 +959,16 @@ class Cam(Gtk.ApplicationWindow):
 
     @property
     def manual(self):
-        return self.S["mode"] != "photo"
+        return self.S["mode"] != "retro"
+
+    @property
+    def retro(self):
+        return self.S["mode"] == "retro"
+
+    @property
+    def filming(self):
+        """the shutter starts a clip"""
+        return self.S["mode"] == "video" or self.retro and self.S["rcap"] == "VIDEO"
 
     @property
     def fps(self):
@@ -785,16 +982,23 @@ class Cam(Gtk.ApplicationWindow):
             return
         was = self.S["mode"]
         self.S["mode"] = mode
+        retro_ui = mode == "retro"
         for m, (b, d) in self.modes.items():
-            d.set(m, (1, 1, 1) if m == mode else (.5, .5, .5))
+            d.set(m, (1, 1, 1) if m == mode else (.62, .64, .7) if retro_ui else (.5, .5, .5))
+        (self.add_css_class if retro_ui else self.remove_css_class)("retro")
+        self.top.set_visible(not retro_ui)
+        self.cambody.set_visible(retro_ui)
+        self.finder.inset = 0 if retro_ui else 88
+        if not retro_ui:
+            self.finder.osd = None
         self.shutter_art.queue_draw()
         self.select(None)
         self.build_tiles()
-        self.zoom_box.set_visible(mode != "video")
+        self.zoom_box.set_visible(mode == "pro")
         if mode == "video":
             self.set_zoom(1)
         self.refresh()
-        if first or (mode == "video") != (was == "video") or not self.pipe:
+        if first or (mode in ("video", "retro") or was in ("video", "retro")) and mode != was or not self.pipe:
             self.start()
         else:
             self.push_controls()
@@ -826,7 +1030,7 @@ class Cam(Gtk.ApplicationWindow):
             ops.append(diag((rg / isp[0]) ** .45, 1, (bg / isp[1]) ** .45))
         if self.S["mode"] == "pro" and self.S["ev"]:
             ops.append(diag(*(2 ** self.S["ev"],) * 3))
-        if self.S["mode"] != "video" and FILTERS[self.S["filter"]][1]:
+        if self.S["mode"] == "pro" and FILTERS[self.S["filter"]][1]:
             ops.append(FILTERS[self.S["filter"]][1])
         return affine(*ops) if ops else None
 
@@ -834,23 +1038,49 @@ class Cam(Gtk.ApplicationWindow):
         S = self.S
         if self.rec:
             t = int(time.monotonic() - self.rec["t0"])
-            left = shutil.disk_usage(VIDS).free * 8 / (VIDEO[S["vres"]][2] * 1000) / 60
+            left = shutil.disk_usage(VIDS).free * 8 / ((RETRO_KBIT if self.retro else VIDEO[S["vres"]][2]) * 1000) / 60
             text = f"REC {t // 60:02d}:{t % 60:02d} | {left:.0f} MIN" + (" | NO MIC" if not self.rec["mic"] else "") \
                 + (f" | DROP {self.rec['drops']}" if self.rec["drops"] else "")
+            if self.retro:
+                return self.update_osd(text.split(" | ")[0] + text.partition(" MIN")[2].replace(" | ", " "))
             return self.status.set(text, RED)
         if S["mode"] == "video":
             text = f"{S['vres']} | {self.fps} FPS | {S['look']}"
+        elif self.retro:
+            return self.update_osd()
         else:
             modes = self.cam[4]
             text = f"{modes[min(S['size'], len(modes) - 1)][0]} | {S['aspect']}" + (" | " + S["stack"] if S["stack"] != "AUTO" else "") \
                 + (" | RAW" if S["dng"] else "") + (f" | {S['timer']}S" if S["timer"] else "")
         self.status.set(text, (1, 1, 1))
 
+    def update_osd(self, rec=""):
+        S, batt = self.S, 1.0
+        try:
+            with open(glob.glob("/sys/class/power_supply/*/capacity")[0]) as f:
+                batt = int(f.read()) / 100
+        except (OSError, ValueError, IndexError):
+            pass
+        os.makedirs(PICS, exist_ok=True)
+        free = shutil.disk_usage(PICS).free
+        left = f"{min(free * 8 / (RETRO_KBIT * 1000) / 60, 999):.0f}MIN" if self.filming else str(int(min(free / 150e3, 9999)))
+        light = "FLASH" if S["flash"] == "OFF" and retro.STYLES[S["rstyle"]].get("flash") and not self.filming else S["flash"]
+        info = [S["rsize"]] * (not self.filming) + [light] * (light != "OFF") + [f"{S['timer']}S"] * bool(S["timer"] and not self.filming)
+        z = self.finder.zoom
+        try:
+            shots = sum(1 for f in os.listdir(PICS) if f.startswith(("IMG_", "VID_")))
+        except OSError:
+            shots = 0
+        self.finder.osd = S["osd"] and dict(date=time.strftime("%d/%m/%y %H:%M"), file=f"100-{shots % 10000:04d}", style=S["rstyle"], cap="VIDEO" if self.filming else "PHOTO", left=left, batt=batt, rec=rec,
+                               zoom=f"{z:.1f}X" if z > 1 else "", info=" ".join(info))
+        self.knob.set_halign(Gtk.Align.END if self.filming else Gtk.Align.START)
+        self.finder.queue_draw()
+
     # ---- value tiles and the ruler
 
     def params(self):
-        if self.S["mode"] == "photo":
-            return []
+        if self.retro:  # what the photographer can turn on top of the style
+            return list(RADJ)
         p = ["fps", "angle"] if self.S["mode"] == "video" else ["shutter"]
         p += ["iso"] + (["ev"] if self.S["mode"] == "pro" else []) + ["wb", "tint"]
         return p + (["focus"] if self.lens_ok() else [])
@@ -860,7 +1090,8 @@ class Cam(Gtk.ApplicationWindow):
             self.tiles_box.remove(c)
         self.tiles = {}
         for k in self.params():
-            name = Gtk.Label(label={"wb": "WB", "iso": "ISO", "ev": "EV", "fps": "FPS"}.get(k, k.upper()), css_classes=["tname"])
+            name = Gtk.Label(label={"wb": "WB", "iso": "ISO", "ev": "EV", "fps": "FPS"}.get(k, RADJ[k][0] if k in RADJ else k.upper()),
+                             css_classes=["tname"])
             val = Gtk.Label(css_classes=["tval"])
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
             box.append(name)
@@ -871,9 +1102,18 @@ class Cam(Gtk.ApplicationWindow):
             self.tiles[k] = (b, val)
         self.tiles_box.set_visible(bool(self.tiles))
 
+    def next_choice(self, k):
+        """a button of the old camera: each press takes the next choice"""
+        if self.rec or self.busy:
+            return
+        opts = [v for _l, v in next(r[3] for r in ROWS if r[0] == k)]
+        self.set_option(k, opts[(opts.index(self.S[k]) + 1) % len(opts)])
+
     def tile_text(self, k):
         """(text, is automatic)"""
         S, (exp, gain) = self.S, self.live
+        if k in RADJ:
+            return (f"{S[k]:+.1f}" if k == "rev" else f"{S[k]:+d}" if k == "rwarm" else f"{S[k]:.1f}X"), S[k] == DEFAULTS[k]
         if k == "shutter":
             return lib.shutter_label(S[k] or exp), not S[k]
         if k == "angle":
@@ -905,7 +1145,7 @@ class Cam(Gtk.ApplicationWindow):
         self.param = k
         if k:
             S = self.S
-            items, major = {
+            items, major = ([(f"{v:g}", v) for v in RADJ[k][1]], RADJ[k][2]) if k in RADJ else {
                 "shutter": ([(lib.shutter_label(u), u) for u in SHUTTERS], 3),
                 "angle": ([(f"{a:g}", a) for a in ANGLES], 1),
                 "iso": (list(zip(map(str, ISOS), GAINS)), 3),
@@ -945,6 +1185,8 @@ class Cam(Gtk.ApplicationWindow):
         k, S = self.param, self.S
         if k in ("ev", "tint"):
             S[k] = 0
+        elif k in RADJ:
+            S[k] = DEFAULTS[k]
         elif k == "fps":
             S[k] = 30
             self.set_fps()
@@ -964,7 +1206,7 @@ class Cam(Gtk.ApplicationWindow):
             self.update_tile(t)
         if k in ("ev", "wb", "tint"):
             self.finder.set_filter(self.view_matrix())
-        elif k != "focus":
+        elif k != "focus" and k not in RADJ:
             self.push_controls()
         self.update_status()
         self.save()
@@ -1009,6 +1251,8 @@ class Cam(Gtk.ApplicationWindow):
             self.start()
         elif key == "look":
             self.push_controls()
+        elif key == "rcap":
+            self.shutter_art.queue_draw()
         self.refresh()
         self.save()
 
@@ -1105,11 +1349,25 @@ class Cam(Gtk.ApplicationWindow):
         # the screen gets a scaled copy, never the camera's own buffer: GTK keeps the last picture it drew,
         # and a camera buffer alive after its pipeline wrecks the next one (see still())
         view = "width=1280,height=720" if video else "width=1440,height=1080"
-        desc = (src + " ! tee name=t t. ! queue leaky=downstream max-size-buffers=2 ! videoconvertscale n-threads=2"
-                f" ! video/x-raw,format=BGRA,{view} ! gtk4paintablesink name=sink"
-                " t. ! queue leaky=downstream max-size-buffers=1 ! appsink name=tap max-buffers=1 drop=true sync=false")
+        tap = " t. ! queue leaky=downstream max-size-buffers=1 ! appsink name=tap max-buffers=1 drop=true sync=false"
+        if self.retro:
+            # camera frames go to retro_loop at twice the old camera's size (halving averages the sensor noise),
+            # come back with the look on, and that is what the screen and the encoder get
+            desc = (src + " ! tee name=t t. ! queue leaky=downstream max-size-buffers=1 ! videoconvertscale n-threads=2"
+                    " ! video/x-raw,format=BGR,width=1280,height=960 ! appsink name=rin max-buffers=1 drop=true sync=false" + tap
+                    + " appsrc name=rout is-live=true do-timestamp=true format=time ! tee name=r"
+                    # async=false: these sinks get nothing until the pipeline plays, so it must not wait for them
+                    " r. ! queue leaky=downstream max-size-buffers=2 ! gtk4paintablesink name=sink async=false")
+        else:
+            desc = (src + " ! tee name=t t. ! queue leaky=downstream max-size-buffers=2 ! videoconvertscale n-threads=2"
+                    f" ! video/x-raw,format=BGRA,{view} ! gtk4paintablesink name=sink" + tap)
         mic = None
-        if record:
+        if record and self.retro:
+            mic = self.microphone()
+            desc += (" r. ! queue name=recq leaky=downstream max-size-buffers=8 ! videoconvert n-threads=2"
+                     f" ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast bitrate={RETRO_KBIT} key-int-max=30 threads=4"
+                     f" ! h264parse ! queue ! mux. mp4mux name=mux ! filesink async=false location=\"{record}\"")
+        elif record:
             mic = self.microphone()
             # the picture is stored as the sensor sees it; players turn it by the orientation tag
             turn = (self.cam[2] - self.theta if name == "back" else self.cam[2] + self.theta) % 360
@@ -1125,6 +1383,10 @@ class Cam(Gtk.ApplicationWindow):
         except GLib.Error as e:
             return self.show_msg(f"Camera unavailable\n{e.message}")
         self.src, self.tap = self.pipe.get_by_name("src"), self.pipe.get_by_name("tap")
+        if self.retro:
+            self.orient()  # before the first frame: a clip keeps this shape
+            threading.Thread(target=self.retro_loop, args=(self.pipe, self.pipe.get_by_name("rin"), self.pipe.get_by_name("rout"), bool(record)),
+                             daemon=True).start()
         self.ctl_sent, self.ctl_todo, self.ctl_left, self.started = self.controls(), {}, 0, time.monotonic()
         if self.src:
             for k, v in self.ctl_sent.items():
@@ -1162,6 +1424,50 @@ class Cam(Gtk.ApplicationWindow):
             GLib.timeout_add(600, lambda: self.set_fps() and False)
         return mic
 
+    def radj(self):
+        return {name: self.S[k] for k, (_l, _v, _m, name) in RADJ.items()}
+
+    def retro_loop(self, pipe, rin, rout, hold):
+        """worker thread, one per pipeline: camera frame in, the old camera's frame out"""
+        look = key = caps = None
+        turns = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+        while self.pipe is pipe and not self.quit:
+            sample = rin.emit("try-pull-sample", 100 * Gst.MSECOND)
+            if not sample:
+                time.sleep(.01)  # not started yet: the pull returns at once
+                continue
+            st, buf = sample.get_caps().get_structure(0), sample.get_buffer()
+            w, h = st.get_value("width"), st.get_value("height")
+            ok, info = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                continue
+            arr = np.frombuffer(info.data, np.uint8)
+            arr = arr[:h * (arr.size // h)].reshape(h, arr.size // h)[:, :w * 3].reshape(h, w, 3)
+            z = self.finder.zoom  # digital zoom: the middle of the frame, blown up
+            cw, ch = int(w / z) // 2 * 2, int(h / z) // 2 * 2
+            arr = arr[(h - ch) // 2:(h + ch) // 2, (w - cw) // 2:(w + cw) // 2]
+            # the copy that lets the camera buffer go; INTER_AREA is the average a small sensor would have made
+            img = cv2.resize(arr, (640, 480), interpolation=cv2.INTER_AREA if cw >= 640 else cv2.INTER_LINEAR)
+            del arr
+            buf.unmap(info)
+            del sample, buf, info
+            turn, style = self.rturn, self.S["rstyle"]
+            if turn:
+                img = cv2.rotate(img, turns[turn])
+            if self.cam[3]:
+                img = cv2.flip(img, 1)  # the front camera shows and keeps the mirror picture
+            oh, ow = img.shape[:2]
+            if key != (style, ow, oh):
+                key, look = (style, ow, oh), retro.Look(style, ow, oh)
+                caps = Gst.Caps.from_string(f"video/x-raw,format=BGRx,width={ow},height={oh},framerate=30/1")
+            look.adj = self.radj()
+            out = cv2.cvtColor(look.render(img, time.time() if self.S["stamp"] else None, live=True), cv2.COLOR_BGR2BGRA).tobytes()
+            self.rframe = (out, ow, oh)
+            if hold and time.monotonic() - self.started < 1.6:
+                continue  # a clip starts once the restarted camera has its white balance back (green until then)
+            if self.pipe is pipe:
+                rout.emit("push-sample", Gst.Sample.new(Gst.Buffer.new_wrapped(out), caps, None, None))
+
     def first_frame(self, pt):
         if self.fresh and self.fresh[0] is pt:
             for h in self.fresh[1]:
@@ -1197,12 +1503,14 @@ class Cam(Gtk.ApplicationWindow):
         self.start()
 
     def set_zoom(self, z):
-        z = min(max(z, 1.0), 8.0) if self.S["mode"] != "video" else 1.0
+        z = min(max(z, 1.0), 8.0 if not self.retro else 4.0) if self.S["mode"] != "video" else 1.0
         if abs(z - round(z)) < .06:
             z = float(round(z))
         if self.finder.zoom != z:
             self.clear_meter()
         self.finder.zoom = z
+        if self.retro:
+            self.update_osd()
         self.finder.queue_draw()
         for c, cz in zip(self.chips, ZOOMS):
             on = cz <= z < (ZOOMS + (99,))[ZOOMS.index(cz) + 1]
@@ -1249,6 +1557,15 @@ class Cam(Gtk.ApplicationWindow):
         self.sheet.set_size_request(340 if land else -1, -1)
         self.scroll.set_max_content_height(250 if land else 470)
         (self.add_css_class if land else self.remove_css_class)("land")
+        # the camera's back: in the hand sideways the switch sits on top, the pad under it, DISP and MENU at the foot
+        disp, pad, menu = self.body_keys
+        for wdg in self.body_keys:
+            if wdg.get_parent():
+                self.keys.remove(wdg)
+        for wdg, col, row, wide in ((pad, 0, 0, 2), (disp, 0, 1, 1), (menu, 1, 1, 1)) if land else ((disp, 0, 0, 1), (pad, 1, 0, 1), (menu, 2, 0, 1)):
+            self.keys.attach(wdg, col, row, wide, 1)
+        self.cambody.reorder_child_after(self.switch_row, None if land else self.keys)
+        self.keys.set_row_spacing(6 if land else 12)
         self.finder.inset = 0 if land else 88
         self.orient()
 
@@ -1261,6 +1578,14 @@ class Cam(Gtk.ApplicationWindow):
         name, _p, rot, mirror, _m = self.cam
         self.finder.rot = (rot - self.ui_theta if name == "back" else rot + self.ui_theta) % 360
         self.finder.mirror = mirror
+        if self.retro:
+            # the look has a top and a bottom (date stamp, tape lines): frames are turned upright for the way
+            # the phone is held before the look goes on, and the screen turns only what is left
+            if not self.rec:  # a clip keeps the shape it started with
+                self.rturn = (rot - self.theta if name == "back" else rot + self.theta) % 360
+            self.finder.rot, self.finder.mirror, self.finder.pre = (self.finder.rot - self.rturn) % 360, False, (self.rturn, mirror)
+        else:
+            self.finder.pre = None
         self.finder.queue_draw()
 
     def gravity(self):
@@ -1302,6 +1627,8 @@ class Cam(Gtk.ApplicationWindow):
             self.finder.level = level
             self.finder.queue_draw()
         if self.landscape and self.ui_theta != self.theta and self.theta in (90, 270):
+            self.orient()
+        elif self.retro and not self.rec and self.rturn != (self.cam[2] + (-self.theta if self.cam[0] == "back" else self.theta)) % 360:
             self.orient()
 
     # ---- frame analysis: exposure tools and autofocus, off the UI thread
@@ -1359,7 +1686,7 @@ class Cam(Gtk.ApplicationWindow):
     # ---- QR codes: scanned off the UI thread on a small grey copy, shown as a pill, acted on only by a tap
 
     def qr_wanted(self):
-        return bool(self.S["qr"] and self.S["mode"] == "photo" and self.tap and not (self.busy or self.rec or self.asleep
+        return bool(self.S["qr"] and self.S["mode"] == "pro" and self.tap and not (self.busy or self.rec or self.asleep
                     or self.paused or self.closing or self.count_id))
 
     def qr_worker(self):
@@ -1592,7 +1919,7 @@ class Cam(Gtk.ApplicationWindow):
                 ov[hot & ~stripe] = (0, 0, 0, 255)
             if S["peaking"] or self.param == "focus":
                 g = np.ascontiguousarray(arr[::2, ::2, 1])
-                edge = np.abs(cv2.Laplacian(cv2.GaussianBlur(g, (0, 0), .8), cv2.CV_16S, ksize=3)) > 28
+                edge = np.abs(cv2.Laplacian(cv2.GaussianBlur(g, (0, 0), .8), cv2.CV_16S, ksize=3)) > 28 + max(0, 70 - int(y.mean()))  # in the dark the noise would light up as a red checkerboard
                 eh, ew = y.shape
                 ov[edge[:eh * 2, :ew * 2].reshape(eh, 2, ew, 2).any(axis=(1, 3))] = (215, 25, 33, 255)
         return hist, clip, ov
@@ -1671,7 +1998,7 @@ class Cam(Gtk.ApplicationWindow):
             return self.shot_failed("Storage full")
         path = output_name(time.time(), self.S["anon"], "VID", "mp4")
         self.sheet_open(False)
-        if self.S["lock"] and not self.locked and not TESTSRC:
+        if self.S["lock"] and not self.locked and not TESTSRC and not self.retro:
             self.show_msg("Locking exposure")
             self.shutter.set_sensitive(False)
             return threading.Thread(target=self.lock, daemon=True).start()
@@ -1749,7 +2076,7 @@ class Cam(Gtk.ApplicationWindow):
         self.touched = time.monotonic()
         if self.paused:
             return self.start()
-        if self.S["mode"] == "video":
+        if self.filming:
             return self.stop_record() if self.rec else self.record()
         if self.count_id:  # a second press cancels the timer
             GLib.source_remove(self.count_id)
@@ -1798,9 +2125,14 @@ class Cam(Gtk.ApplicationWindow):
         dev = ["--zoom", f"{zoom:g}", "--size", str(size), "--rot", str(turn)]
         if self.meter:
             dev += ["--meter", "%.4f,%.4f" % self.meter]
-        if FILTERS[S["filter"]][1]:
+        if self.retro:  # 12 MP in, the old camera's few pixels out
+            mode, frames = modes[0][1:3]
+            dev = ["--zoom", f"{zoom:g}", "--size", str(modes[0][3]), "--rot", str(turn), "--retro", S["rstyle"],
+                   "--retro-size", str(retro.SIZES[S["rsize"]]),
+                   "--retro-adj", ",".join(f"{v:g}" for v in self.radj().values())] + (["--stamp", f"{time.time():.0f}"] if S["stamp"] else [])
+        elif FILTERS[S["filter"]][1]:
             dev += ["--matrix", ",".join(f"{v:.5f}" for r in FILTERS[S["filter"]][1] for v in r)]
-        if S["aspect"] != "4:3":
+        if S["aspect"] != "4:3" and not self.retro:
             dev += ["--aspect", f"{dict(lib.ASPECTS)[S['aspect']]:.4f}"]
         man = (None, None)
         if S["mode"] == "pro":
@@ -1825,8 +2157,10 @@ class Cam(Gtk.ApplicationWindow):
         os.makedirs(PICS, exist_ok=True)
         path = output_name(time.time(), self.S["anon"])
         SHOT_T[path] = time.monotonic()
-        threading.Thread(target=self.grab, args=(name, mode, frames, path, dev, man, S["flash"] == "FLASH", S["stack"],
-                                                 S["dng"], S["mode"] == "pro" and S["ev"] or 0.0), daemon=True).start()
+        threading.Thread(target=self.grab, args=(name, mode, frames, path, dev, man,
+                                                 S["flash"] == "FLASH" or self.retro and bool(retro.STYLES[S["rstyle"]].get("flash"))
+                                                 and S["flash"] != "TORCH" and name == "back",
+                                                 S["stack"], S["dng"] and not self.retro, S["mode"] == "pro" and S["ev"] or 0.0), daemon=True).start()
 
     def grab(self, name, mode, frames, path, dev, man, flash, stack, dng, ev):
         """worker thread: viewfinder exposure, raw frames to disk, viewfinder back, develop queued"""
@@ -1963,6 +2297,7 @@ class Cam(Gtk.ApplicationWindow):
         """screen off, locked or covered: the sensor and the software ISP stop (they are the phone's
         biggest heater), a recording is closed properly first; back in view, the viewfinder returns"""
         self.asleep = self.props.suspended
+        self.claim_keys()
         if os.environ.get("PHONECAM_DEBUG"):
             print("suspended", self.asleep, file=sys.stderr, flush=True)
         if not self.asleep:
@@ -1978,6 +2313,35 @@ class Cam(Gtk.ApplicationWindow):
         self.stop()
         self.set_lens(-1)
         self.set_led(False)
+
+    def claim_keys(self):
+        """tell the shell whether this window takes the volume keys now (it then leaves the volume alone).
+        shortcut: a camera that crashed in front leaves the claim behind until the next camera starts or closes"""
+        want = self.S["volkeys"] and self.props.is_active and not self.asleep and not self.closing
+        try:
+            with open(os.path.join(STATE, "camera-keys"), "w") as f:
+                f.write("1\n" if want else "0\n")
+        except OSError:
+            pass
+        return want
+
+    def on_button(self, *_):
+        try:
+            with open(os.path.join(STATE, "button")) as f:
+                seq, _, event = f.read().strip().partition(" ")
+        except OSError:
+            return
+        first, self.btn_seq = self.btn_seq is None, seq
+        now = time.monotonic()
+        if first or event not in ("volup", "voldown") or not self.claim_keys() or now - self.btn_t < .35:
+            return  # a held key repeats: one press, one picture
+        self.btn_t = now
+        if self.retro and self.S["haptic"]:
+            BUZZ.play(45 if event == "volup" else 18)
+        if event == "volup":
+            self.shutter_clicked()
+        elif self.S["mode"] != "video":
+            self.set_zoom({1: 2, 2: 4}.get(round(self.finder.zoom), 1))
 
     def on_close(self, *_):
         """photos still in the queue get finished with the window hidden"""

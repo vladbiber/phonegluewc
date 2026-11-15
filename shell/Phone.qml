@@ -369,7 +369,9 @@ Singleton {
         } else if (event === "single") {
             Quickshell.execDetached(["phonegluewc-msg", "power", screenOff ? "on" : "off"]);
         } else if (event === "volup" || event === "voldown") {
-            Status.stepVolume(event === "volup" ? 0.05 : -0.05);
+            // the camera in front takes these as shutter and zoom, and reads the same button file itself
+            if (cameraKeys.text().trim() !== "1")
+                Status.stepVolume(event === "volup" ? 0.05 : -0.05);
         } else if (event === "chord") {
             runButton("screenshot");
         } else if (event === "double" || event === "triple") {
@@ -396,6 +398,13 @@ Singleton {
                 }
             }
         }
+    }
+    FileView {
+        id: cameraKeys
+        path: root.stateDir + "/camera-keys"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
     }
     FileView {
         path: root.stateDir + "/button"

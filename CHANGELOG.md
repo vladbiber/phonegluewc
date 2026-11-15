@@ -4,6 +4,14 @@
 
 ### Added
 
+- The lock screen shows the top status bar of the home screen (clock, signal,
+  Wi-Fi, Bluetooth, battery), read-only
+- Camera: volume up takes the picture and volume down zooms while the camera
+  is in front
+- Camera: RETRO mode, an old camera instead of a filter. Five looks (Digicam, VHS,
+  Dream, Liminal, Night) for photos and clips, built on a picture shrunk to the
+  old camera's size, with a date stamp and calm blacks in the dark. PRO is now
+  the normal photo mode and the plain Photo mode is gone
 - Touchscreens: touches go to the window under the finger, while the overview
   and windows without touch support get a left mouse button from the first
   finger. Four fingers leave the application and act like a four-finger
