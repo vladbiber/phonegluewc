@@ -35,7 +35,7 @@ STYLES = {
                     gamma=1.12, knee=.6, sat=.55, tint=((2, -4), (4, -8)), bloom=.1, vig=.38, noise=3.5, cnoise=1.0, jpeg=55,
                     stamp="date", dark=dict(sat=.7, tint=((0, -8), (3, -12)), vig=.5, lift=14)),
     "NIGHT": dict(soft=.5, night=True, chroma=(6, 6), black=14, white=225, knee=.65, sat=1.0, tint=((-3, 12), (1, -4)),
-                  bloom=.3, vig=.45, noise=2.2, jpeg=45, stamp="date", flash=True),
+                  bloom=.3, vig=.45, noise=2.2, jpeg=45, stamp="date"),
 }
 # what the photographer can turn on top of a style: stops, colour x, warmth (red up, blue down), grain x, blur x, glow x
 ADJ = dict(ev=0.0, sat=1.0, warm=0.0, grain=1.0, soft=1.0, glow=1.0)
@@ -225,11 +225,24 @@ class Look:
             sub[:] = (sub * (1 - a) + np.array(rgb, np.float32) * a).astype(np.uint8)
 
 
-def still(img, style, width=640, stamp=None, adj=None):
-    """a developed photo (BGR, upright) as the old camera would have saved it"""
+def match(img, ref):
+    """give a developed photo the brightness and colour of the viewfinder frame taken with it (mean and spread per Lab channel)"""
+    a = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    b = cv2.cvtColor(cv2.resize(ref, (64, 48), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    s = cv2.resize(a, (64, 48), interpolation=cv2.INTER_AREA).reshape(-1, 3)
+    gain = np.clip(b.std(0) / np.maximum(s.std(0), 1), .6, 1.7)
+    return cv2.cvtColor(np.clip((a - s.mean(0)) * gain + b.mean(0), 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def still(img, style, width=640, stamp=None, adj=None, ref=None):
+    """a developed photo (BGR, upright) as the old camera would have saved it; ref: the viewfinder frame whose colours it keeps"""
     h, w = img.shape[:2]
     scale = width / max(w, h)
-    return Look(style, round(w * scale), round(h * scale), adj=adj).render(img, stamp)
+    w, h = round(w * scale), round(h * scale)
+    img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+    if ref is not None:
+        img = match(img, ref)
+    return Look(style, w, h, adj=adj).render(img, stamp)
 
 
 def selfcheck():
@@ -250,6 +263,9 @@ def selfcheck():
     white = np.full((480, 640, 3), 255, np.uint8)
     for name in ("DIGICAM", "VHS", "DREAM"):
         assert 200 < np.median(still(white, name)) < 250, name
+    warm = np.full((48, 64, 3), (60, 120, 200), np.uint8)  # the developed photo takes the viewfinder's colour
+    got = match(rng.integers(90, 130, (480, 640, 3), dtype=np.uint8), warm).reshape(-1, 3).mean(0)
+    assert abs(got[0] - 60) < 12 and abs(got[2] - 200) < 12, got
     grey = np.full((480, 640, 3), 110, np.uint8)
     assert np.median(still(grey, "DIGICAM", adj=dict(ev=1.0))) > np.median(still(grey, "DIGICAM")) + 25
 

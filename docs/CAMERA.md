@@ -34,7 +34,7 @@ Styles (STYLE tile, or the settings sheet), all in `camera/phonecamretro.py` as 
   stops short of white, line noise, the torn band at the bottom, time and date in the corner.
 - DREAM: hazy, milky blacks, little colour, glow around lights, heavy compression.
 - LIMINAL: yellowed and dim, dark corners, grain.
-- NIGHT: a flash photo in the dark. The LED fires by itself, blacks are crushed, shadows go blue.
+- NIGHT: the dark as a cheap camera saw it: blacks crushed, shadows blue. LIGHT decides about the LED, as in every style.
 
 The same renderer runs on live frames (`retro_loop` in `phonecam`: camera frame in, 640 x 480 frame out, to the
 screen and to the encoder) and on the developed raw photo (`phonecam-develop --retro STYLE`), so the viewfinder,
@@ -56,12 +56,19 @@ photographer's own corrections on top of the style, for the live picture, clips 
 
 The ISO tile sets the sensor gain by hand, as in PRO.
 
-The retro screen is the back of a compact camera: DISP clears the screen, the information (battery, shots left,
-file number, date and time; never in the picture) and the tiles under it, MENU opens the settings, the round pad has STYLE in the
-middle and ZOOM, LIGHT, TIMER, SIZE around it. Turned sideways the screen is on the left and the keys on the
+The retro screen is the back of a compact camera: DISP puts the date in the picture or takes it out, MENU opens the settings, the round pad has STYLE in the
+middle and ZOOM, LIGHT, TIMER, FILTER around it. SCREEN INFO in the settings clears the screen text and the tiles. Turned sideways the screen is on the left and the keys on the
 right. Buttons buzz at the press (BUTTON FEEL).
 
 Volume keys: with the camera in front, volume up takes the picture (or starts and stops a clip) and volume down
 zooms, in every mode (VOLUME KEYS in the settings). The compositor keeps sending the keys as button events; the
 camera reads `~/.local/state/phonegluewc/button` itself and writes `1` to `camera-keys` next to it while it is
 the active window, which is when the shell leaves the volume alone.
+
+FILTER says how much is done to a retro photo after the shutter:
+
+- RAW: the photo is the frame that was on the screen, saved as it is (640 x 480, at once, the sensor keeps running).
+- SEMI: the photo is developed from the sensor's raw frames (cleaner, stacked in the dark, any PHOTO SIZE), then
+  moved to the brightness and colour of the viewfinder frame taken with it (`phonecamretro.match`), then the look.
+- FULL: developed from the raw frames with the developer's own colour, then the look. Colours can differ from
+  the viewfinder, which shows the camera driver's own processing.

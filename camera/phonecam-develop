@@ -3,7 +3,7 @@
                  [--ccm s5kjn1|none] [--sat F] [--black N] [--zoom Z] [--size LONG_EDGE]
                  [--meter X,Y] [--matrix 12 floats] [--wb RGAIN,BGAIN] [--ev STOPS] [--gain F]
                  [--aspect RATIO] [--dng OUT.dng] [--exif EXPOSURE_US,ISO]
-                 [--retro STYLE [--retro-size LONG_EDGE] [--stamp UNIXTIME] [--retro-adj EV,SAT,WARM,GRAIN,SOFT,GLOW]]
+                 [--retro STYLE [--retro-size LONG_EDGE] [--stamp UNIXTIME] [--retro-adj EV,SAT,WARM,GRAIN,SOFT,GLOW] [--match VIEWFINDER.png]]
 
 --zoom crops the centre, --size scales the result to that long edge, --meter exposes for the point
 (0..1, sensor orientation), --matrix is a 3x4 row-major colour filter on 0..1 sRGB RGB (offset last).
@@ -379,7 +379,8 @@ if __name__ == "__main__":
         import phonecamretro
         img = phonecamretro.still(img, opts["--retro"], int(opts.get("--retro-size", 640)),
                                   float(opts["--stamp"]) if "--stamp" in opts else None,
-                                  dict(zip(phonecamretro.ADJ, fl("--retro-adj"))) if "--retro-adj" in opts else None)
+                                  dict(zip(phonecamretro.ADJ, fl("--retro-adj"))) if "--retro-adj" in opts else None,
+                                  cv2.imread(opts["--match"]) if "--match" in opts else None)
     # 4:4:4 at 97: 4:2:0 at 93 left 16 px chroma squares and 8 px luma blocks in smooth dark areas
     if not cv2.imwrite(dst, img, [cv2.IMWRITE_JPEG_QUALITY, 97, cv2.IMWRITE_JPEG_SAMPLING_FACTOR,
                                   cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]):

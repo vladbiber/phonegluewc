@@ -105,7 +105,7 @@ PICS = os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTU
                     or os.path.expanduser("~/Pictures"), "Camera")
 VIDS = PICS  # one camera roll: the gallery shows a single folder
 CONF = os.path.join(GLib.get_user_config_dir(), "phonecam.json")
-DEFAULTS = dict(qr=True, mode="pro", rstyle="VHS", rcap="PHOTO", rsize="VGA", stamp=True, haptic=True, osd=True, volkeys=True,
+DEFAULTS = dict(qr=True, mode="pro", rstyle="VHS", rcap="PHOTO", rsize="VGA", rproc="RAW", stamp=True, haptic=True, osd=True, volkeys=True,
                 rev=0.0, rsat=1.0, rwarm=0, rgrain=1.0, rsoft=1.0, rglow=1.0, size=0, aspect="4:3", stack="AUTO", dng=False, anon=False, timer=0, filter=0, flash="OFF",
                 grid=False, level=False, hist=True, zebra=0, peaking=False, falsecolor=False,
                 vres="1080P", fps=30, look="STANDARD", lock=False, vguide="OFF",
@@ -121,12 +121,14 @@ ROWS = [
      ONOFF, "pro video retro"),
     ("timer", "TIMER", "", [("OFF", 0), ("3 S", 3), ("10 S", 10)], "pro retro"),
     ("filter", "FILTER", "", [(n.upper(), i) for i, (n, _) in enumerate(FILTERS)], "pro"),
-    ("rstyle", "STYLE", "Digicam: an early 2000s compact, loud colours and burnt skies. VHS: camcorder tape. Dream: hazy and washed out. Liminal: yellowed, dim corners. Night: a flash photo in the dark",
+    ("rstyle", "STYLE", "Digicam: an early 2000s compact, loud colours and burnt skies. VHS: camcorder tape. Dream: hazy and washed out. Liminal: yellowed, dim corners. Night: crushed blacks and blue shadows, with the light or without",
      [(k, k) for k in retro.STYLES], "retro"),
     ("rcap", "CAPTURE", "", [("PHOTO", "PHOTO"), ("VIDEO", "VIDEO")], "retro"),
-    ("rsize", "PHOTO SIZE", "Old cameras were small: VGA is 640 x 480. Clips are always VGA", [(k, k) for k in retro.SIZES], "retro"),
-    ("stamp", "DATE STAMP", "", ONOFF, "retro"),
-    ("osd", "SCREEN INFO", "Battery, shots left, date and time on the screen (never in the picture) and the tiles under it. DISP switches it too", ONOFF, "retro"),
+    ("rproc", "FILTER", "Raw: the photo is the frame on the screen, untouched. Semi: developed from the sensor for a cleaner picture, then given the screen's colours. Full: developed with its own colours",
+     [("RAW", "RAW"), ("SEMI", "SEMI"), ("FULL", "FULL")], "retro"),
+    ("rsize", "PHOTO SIZE", "Old cameras were small: VGA is 640 x 480. Clips and Raw photos are always VGA", [(k, k) for k in retro.SIZES], "retro"),
+    ("stamp", "DATE STAMP", "In the picture. DISP switches it too", ONOFF, "retro"),
+    ("osd", "SCREEN INFO", "Battery, shots left, date and time on the screen (never in the picture) and the tiles under it", ONOFF, "retro"),
     ("volkeys", "VOLUME KEYS", "Volume up takes the picture, volume down zooms", ONOFF, "pro video retro"),
     ("haptic", "BUTTON FEEL", "The buttons of the old camera click under the finger", ONOFF, "retro"),
     ("vres", "RESOLUTION", "H.264 in MP4", [(k, k) for k in VIDEO], "video"),
@@ -593,6 +595,7 @@ class Cam(Gtk.ApplicationWindow):
         self.qr_in, self.qr_ev, self.qr_last = None, threading.Event(), 0.0
         self.qrimg = os.environ.get("PHONECAM_QRIMG")
         self.qr_info, self.qr_seen, self.qr_text = None, 0.0, None
+        self.rsrc = None  # retro: the newest camera frame before the look
         self.rframe, self.rturn = None, 0  # retro: the last frame drawn, how far frames are turned before the look
 
         self.finder = Finder()
@@ -693,11 +696,11 @@ class Cam(Gtk.ApplicationWindow):
         for text, name, fn, col, row in (
                 ("ZOOM", "Zoom", lambda: self.set_zoom({1: 2, 2: 4}.get(round(self.finder.zoom), 1)), 1, 0),
                 ("LIGHT", "Light", self.next_light, 0, 1), ("TIMER", "Timer", lambda: self.next_choice("timer"), 2, 1),
-                ("SIZE", "Photo size", lambda: self.next_choice("rsize"), 1, 2)):
+                ("FILTER", "Filter", lambda: self.next_choice("rproc"), 1, 2)):
             pad.attach(key(text, name, fn, "dir", 1.1), col, row, 1, 1)
         pad.attach(key("STYLE", "Style", lambda: self.next_choice("rstyle"), "cbtn big"), 1, 1, 1, 1)
         self.keys = Gtk.Grid(halign=Gtk.Align.CENTER, column_spacing=26, row_spacing=12, margin_top=6)
-        self.body_keys = (key("DISP", "Screen info", lambda: self.next_choice("osd")), pad,
+        self.body_keys = (key("DISP", "Date stamp", lambda: self.next_choice("stamp")), pad,
                           key("MENU", "Settings", lambda: self.sheet_open(not self.sheet.get_reveal_child())))
         self.knob = Gtk.Box(css_classes=["knob"], halign=Gtk.Align.START, valign=Gtk.Align.CENTER)
         slot = button(child=self.knob, css_classes=["slot"], name_="Photo or video", valign=Gtk.Align.CENTER)
@@ -1064,14 +1067,14 @@ class Cam(Gtk.ApplicationWindow):
         os.makedirs(PICS, exist_ok=True)
         free = shutil.disk_usage(PICS).free
         left = f"{min(free * 8 / (RETRO_KBIT * 1000) / 60, 999):.0f}MIN" if self.filming else str(int(min(free / 150e3, 9999)))
-        light = "FLASH" if S["flash"] == "OFF" and retro.STYLES[S["rstyle"]].get("flash") and not self.filming else S["flash"]
-        info = [S["rsize"]] * (not self.filming) + [light] * (light != "OFF") + [f"{S['timer']}S"] * bool(S["timer"] and not self.filming)
+        light = S["flash"]
+        info = [S["rsize"] if S["rproc"] != "RAW" else "VGA"] * (not self.filming) + [light] * (light != "OFF") + [f"{S['timer']}S"] * bool(S["timer"] and not self.filming)
         z = self.finder.zoom
         try:
             shots = sum(1 for f in os.listdir(PICS) if f.startswith(("IMG_", "VID_")))
         except OSError:
             shots = 0
-        self.finder.osd = S["osd"] and dict(date=time.strftime("%d/%m/%y %H:%M"), file=f"100-{shots % 10000:04d}", style=S["rstyle"], cap="VIDEO" if self.filming else "PHOTO", left=left, batt=batt, rec=rec,
+        self.finder.osd = S["osd"] and dict(date=time.strftime("%d/%m/%y %H:%M"), file=f"100-{shots % 10000:04d}", style=S["rstyle"], cap="VIDEO" if self.filming else "PHOTO " + S["rproc"], left=left, batt=batt, rec=rec,
                                zoom=f"{z:.1f}X" if z > 1 else "", info=" ".join(info))
         self.knob.set_halign(Gtk.Align.END if self.filming else Gtk.Align.START)
         self.finder.queue_draw()
@@ -1106,8 +1109,12 @@ class Cam(Gtk.ApplicationWindow):
         """a button of the old camera: each press takes the next choice"""
         if self.rec or self.busy:
             return
-        opts = [v for _l, v in next(r[3] for r in ROWS if r[0] == k)]
-        self.set_option(k, opts[(opts.index(self.S[k]) + 1) % len(opts)])
+        title, opts = next((r[1], r[3]) for r in ROWS if r[0] == k)
+        i = ([v for _l, v in opts].index(self.S[k]) + 1) % len(opts)
+        self.set_option(k, opts[i][1])
+        self.show_msg(f"{title}  {opts[i][0]}")  # said on the screen: not every choice shows in the picture
+        self.said = n = getattr(self, "said", 0) + 1
+        GLib.timeout_add(900, lambda: n == self.said and self.show_msg("") and False)
 
     def tile_text(self, k):
         """(text, is automatic)"""
@@ -1466,6 +1473,7 @@ class Cam(Gtk.ApplicationWindow):
                 key, look = (style, ow, oh), retro.Look(style, ow, oh)
                 caps = Gst.Caps.from_string(f"video/x-raw,format=BGRx,width={ow},height={oh},framerate=30/1")
             look.adj = self.radj()
+            self.rsrc = img
             out = cv2.cvtColor(look.render(img, time.time() if self.S["stamp"] else None, live=True), cv2.COLOR_BGR2BGRA).tobytes()
             self.rframe = (out, ow, oh)
             if hold and time.monotonic() - self.started < 1.6:
@@ -2117,8 +2125,31 @@ class Cam(Gtk.ApplicationWindow):
         self.capture()
         return False
 
+    def snap_live(self, lit=False):
+        """Raw: the frame on the screen is the photo, with nothing developed afterwards"""
+        if self.S["flash"] == "FLASH" and self.cam[0] == "back" and not lit:
+            self.set_led(True)
+            return GLib.timeout_add(900, lambda: self.snap_live(True) and False)  # the exposure takes the light in
+        if lit:
+            self.set_led(False)
+        if not self.rframe:
+            return
+        data, w, h = self.rframe
+        self.flash.add_css_class("on")
+        GLib.timeout_add(70, lambda: self.flash.remove_css_class("on") or False)
+        os.makedirs(PICS, exist_ok=True)
+        path = output_name(time.time(), self.S["anon"])
+        while os.path.exists(path):  # several within one second
+            path = path[:-4] + "_1.jpg"
+        if not cv2.imwrite(path, np.frombuffer(data, np.uint8).reshape(h, w, 4)[:, :, :3], [cv2.IMWRITE_JPEG_QUALITY, 92]):
+            return self.shot_failed("Cannot save the photo")
+        self.pending += 1
+        self.developed(path, None)
+
     def capture(self):
         S = self.S
+        if self.retro and S["rproc"] == "RAW":
+            return self.snap_live()
         name, _p, rot, _mirror, modes = self.cam
         _, mode, frames, size = modes[min(S["size"], len(modes) - 1)]
         zoom = self.finder.zoom
@@ -2161,10 +2192,14 @@ class Cam(Gtk.ApplicationWindow):
         self.finder.set_paintable(snap)
         os.makedirs(PICS, exist_ok=True)
         path = output_name(time.time(), self.S["anon"])
+        if self.retro and S["rproc"] == "SEMI" and self.rsrc is not None:
+            # the camera frame the viewfinder showed (before the look) goes along: the developed photo takes its colours
+            ref = os.path.join(GLib.get_user_cache_dir(), os.path.basename(path) + ".ref.png")
+            if cv2.imwrite(ref, self.rsrc):
+                dev += ["--match", ref]
         SHOT_T[path] = time.monotonic()
         threading.Thread(target=self.grab, args=(name, mode, frames, path, dev, man,
-                                                 S["flash"] == "FLASH" or self.retro and bool(retro.STYLES[S["rstyle"]].get("flash"))
-                                                 and S["flash"] != "TORCH" and name == "back",
+                                                 S["flash"] == "FLASH",
                                                  S["stack"], S["dng"] and not self.retro, S["mode"] == "pro" and S["ev"] or 0.0), daemon=True).start()
 
     def grab(self, name, mode, frames, path, dev, man, flash, stack, dng, ev):
@@ -2259,7 +2294,7 @@ class Cam(Gtk.ApplicationWindow):
             except OSError as e:
                 err = str(e)
             finally:
-                for f in (raw, path + ".part.jpg"):
+                for f in (raw, path + ".part.jpg") + tuple(dev[dev.index("--match") + 1:][:1] if "--match" in dev else ()):
                     if os.path.exists(f):
                         os.unlink(f)
             GLib.idle_add(self.developed, None if err else path, err)
